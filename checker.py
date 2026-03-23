@@ -640,7 +640,9 @@ _SV_CORE = (
     r"grugnì|strill\u00f2|rantol\u00f2|gem\u00e8|sbuff\u00f2|bofonchi\u00f2|ghign\u00f2|"
     # Verbs of proposing/suggesting — common in fiction, passato remoto 3rd-sing.
     # Absent from previous list; caused fallback-to-end-of-text quote wrapping (Image 2).
-    r"propose|sugger\u00ec"
+    r"propose|sugger\u00ec|"
+    # Verbs of coaxing/flattering with object-pronoun construction (lo blandì, la sedusse…)
+    r"bland\u00ec|sedusse|lusingò"
 )
 # _SV: Full verb list for INLINE same-row attribution matching.
 # Context (same-row dialogue) makes ambiguity much lower here.
@@ -1228,7 +1230,7 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
         # Fix: use the EN source as the primary reference instead of MT.
         # The EN is generated independently from Chinese and will not share the
         # CDReader MT boundary error.
-        _is_bleed_row = sort_n in _bleed_sorts and _bleed_sorts[sort_n] in ('bleed', 'bgs')
+        _is_bleed_row = sort_n in _bleed_sorts and _bleed_sorts[sort_n] in ('bleed', 'bgs', 'source_align')
         if _is_bleed_row:
             _en_src = _eng_by_sort_ur.get(sort_n, "")
             _mt_src = ref_text  # MT (may be boundary-corrupt — used as secondary context only)
@@ -1319,6 +1321,18 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
                                      max_tokens=4096 if _use_4096 else 2048)
         if result and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
+            # EN-primary re-bleed guard: if Gemini still returned inflated content
+            # despite the EN-source bleed prompt, restore from MT reference.
+            # Threshold matches batch Guard 2 EN-primary trigger (2.5x, delta>=4).
+            _en_w_ur = len((_eng_by_sort_ur.get(sort_n) or "").split())
+            _out_w_ur = len(new_content.split())
+            if (_en_w_ur >= 3
+                    and _out_w_ur > _en_w_ur * 2.5
+                    and (_out_w_ur - _en_w_ur) >= 4):
+                log(f"    ⚠️  sort={sort_n}: retry re-bleed detected "
+                    f"({_out_w_ur}w vs EN={_en_w_ur}w) — keeping MT")
+                # keep current MT content (already in rephrased_by_sort from _post_process)
+                continue
             if new_content != current_out:
                 new_sim = _row_sim(new_content, ref_text) if "similar" in reason else 0
                 # Concept B: if the API returned different text but it's STILL above
@@ -1819,7 +1833,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         _wc_out_n1 = len(_out_n1.split())
         _wc_mt_n1  = len(_mt_n1.split())
         _inflated  = (_wc_mt_n >= 1               # P2: lowered from 2 — catches single-word rows (e.g. '"Certo."')
-                      and _wc_out_n > _wc_mt_n * 1.3
+                      and _wc_out_n >= _wc_mt_n * 1.25  # lowered from 1.3, >= catches exact boundary (Image 4)
                       and (_wc_out_n - _wc_mt_n) >= 2)
         _starts_lc = bool(_out_n1 and _out_n1[0].islower())
         _deflated  = (_wc_mt_n1 >= 3 and _wc_out_n1 < _wc_mt_n1 * 0.6)
@@ -1952,7 +1966,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # and the comma+SV belongs to narration, not attribution after the speech.
         #   ✓ '"Tienila d\'occhio," disse.' → no boundary before disse → fire at comma
         #   ✗ '"Stai spiando? Hank quasi, annuì.' → ? + Hank (non-SV) before annuì → defer to P4
-        m = re.search(r',\s+(' + _SV + r')\b', text, re.IGNORECASE)
+        # PRONOUN EXTENSION: Italian attribution frequently uses object/reflexive clitic
+        # pronouns between comma and verb: ", lo disse", ", le chiese", ", si voltò"
+        # The optional non-capturing group (?:PRON\s+)? allows P2 to fire on these.
+        _P2_PRON = r'(?:(?:lo|la|gli|le|li|si|me|te|ce|ve|ne)\s+)?'
+        m = re.search(r',\s+' + _P2_PRON + r'(' + _SV + r')\b', text, re.IGNORECASE)
         if m:
             _pre_sv = text[:m.start()]
             _bound = re.search(r'[?!]\s+([A-Z][a-zA-Zàèéìòù]*)', _pre_sv)
@@ -3179,6 +3197,92 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     _title_row = next((r for r in input_data if r.get("sort") == 0), None)
     gemini_input_data = [r for r in input_data if r.get("sort") != 0]
 
+    # ── Pre-batch Guard: Source-alignment isolation (Fix 1) ──────────────────
+    # Root cause: CDReader's MT for some rows is contaminated — the machine
+    # translation spans content from row N AND row N+1 (or N+2), making the
+    # MT 2-5× longer than the EN source. Gemini receives this contaminated MT
+    # as the text to rephrase and faithfully reproduces the bled content.
+    #
+    # Detection: MT/EN word-count ratio ≥ 2.5 AND MT ≥ 8 words.
+    # (EN is generated independently from Chinese; the ratio indicates MT boundary error.)
+    #
+    # Fix: replace the row's content in gemini_input_data with a TRIMMED MT,
+    # capped at EN_words × 1.8 words, preserving whole sentences from the MT start.
+    # This prevents Gemini from seeing the contaminated tail.
+    # Row is also pre-tagged in _pre_batch_source_align so unified_retry routes it
+    # through the EN-source bleed path (not the contaminated-MT truncated path).
+    #
+    # Fix 2 — Forward-shift guard:
+    # A second class of CDReader MT boundary error: sort N MT ends with ":" (or "—")
+    # where sort N EN does NOT (CDReader shifted the trailing noun into sort N+1 MT).
+    # Sort N+1 MT then starts with a proper noun that semantically belongs to sort N.
+    # Neither bleed guard fires because output ≈ MT word count.
+    # Detection: sort N MT ends with ":" AND that ending ":" is NOT in sort N EN
+    #            AND first proper-noun word of sort N+1 MT appears in sort N EN
+    #            AND that word does NOT appear at the start of sort N+1 EN.
+    # Fix: tag sort N+1 as source_align for EN-source retry.
+
+    _pre_batch_source_align: set = set()  # sort numbers pre-tagged as source_align
+
+    def _trim_mt_to_en_length(mt_text, en_words, multiplier=1.8):
+        """Cap MT text to en_words * multiplier words, preserving whole sentences."""
+        cap = max(int(en_words * multiplier), en_words + 3)
+        words = mt_text.split()
+        if len(words) <= cap:
+            return mt_text
+        # Find last sentence boundary within cap words
+        candidate = ' '.join(words[:cap])
+        last_break = max(candidate.rfind('. '), candidate.rfind('? '),
+                         candidate.rfind('! '), candidate.rfind('." '))
+        if last_break > len(candidate) * 0.4:
+            return candidate[:last_break + 1].strip()
+        return candidate.strip()
+
+    _sa_fixed = 0
+    _fwd_fixed = 0
+    _sorted_gid = sorted(gemini_input_data, key=lambda r: r.get('sort', 0))
+    for _gi, _row in enumerate(_sorted_gid):
+        _s      = _row.get('sort', 0)
+        _mt_w   = len((_row.get('content') or '').split())
+        _en_txt = (_row.get('original') or '').strip()
+        _en_w   = len(_en_txt.split())
+
+        # Fix 1: source-align isolation
+        if _en_w >= 2 and _mt_w >= 8 and (_mt_w / _en_w) >= 2.5:
+            _trimmed = _trim_mt_to_en_length(_row['content'], _en_w)
+            if _trimmed != _row['content']:
+                _row['content'] = _trimmed
+                _pre_batch_source_align.add(_s)
+                _sa_fixed += 1
+                log(f"  ⚠️  Pre-batch SA: sort={_s} MT trimmed {_mt_w}w→{len(_trimmed.split())}w "
+                    f"(EN={_en_w}w ratio={_mt_w/_en_w:.1f}x)")
+
+        # Fix 2: forward-shift guard (runs on N+1, needs pair)
+        if _gi == 0:
+            continue
+        _prev_row = _sorted_gid[_gi - 1]
+        _prev_mt  = (_prev_row.get('content') or '').rstrip()
+        _prev_en  = (_prev_row.get('original') or '').strip()
+        # Sort N MT ends with ':' but sort N EN does NOT → CDReader forward-shifted content
+        if _prev_mt.endswith(':') and not _prev_en.endswith(':'):
+            _n1_mt_first = re.match(r'^"?([A-ZÀÈÉÌÒÙ][a-zàèéìòùA-Z]*)', _row.get('content') or '')
+            if _n1_mt_first:
+                _fw_word = _n1_mt_first.group(1)
+                # That word appears in sort N EN but NOT at the start of sort N+1 EN
+                _en_n1 = (_row.get('original') or '').strip()
+                _fw_in_prev_en  = _fw_word.lower() in _prev_en.lower()
+                _fw_starts_n1   = _en_n1.lower().startswith(_fw_word.lower())
+                if _fw_in_prev_en and not _fw_starts_n1:
+                    _pre_batch_source_align.add(_s)
+                    _fwd_fixed += 1
+                    log(f"  ⚠️  Pre-batch FWD: sort={_s} first word {_fw_word!r} "
+                        f"belongs to prev EN (forward-shift) — tagged for EN-source retry")
+
+    if _sa_fixed:
+        log(f"  💬 Pre-batch: {_sa_fixed} source-align row(s) MT trimmed.")
+    if _fwd_fixed:
+        log(f"  💬 Pre-batch: {_fwd_fixed} forward-shift row(s) tagged for EN-source retry.")
+
     # Split into batches and call Gemini for each
     batches = [gemini_input_data[i:i+BATCH_SIZE] for i in range(0, len(gemini_input_data), BATCH_SIZE)]
     total_batches = len(batches)
@@ -3233,26 +3337,28 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             _mt_trigger = (_inp_w >= _INFLATION_MIN_DELTA
                            and _out_w > _inp_w * _INFLATION_THRESHOLD
                            and (_out_w - _inp_w) >= _INFLATION_MIN_DELTA)
+            # Fix 4 — EN-primary trigger: catches source-align rows where the CDReader
+            # MT is contaminated and far longer than EN. Standard MT-based trigger is
+            # blind because MT word count already includes the bled content. Using EN
+            # as the reference catches re-bleed in retry (sort=21: EN=4w, retry=27w).
+            # Threshold 2.5x EN with delta>=4: allows legitimate IT expansion (10w→14w)
+            # but catches 4w→27w re-bleed.
+            _en_primary_trigger = (_en_w >= 3
+                                   and _out_w > _en_w * 2.5
+                                   and (_out_w - _en_w) >= 4)
             # EN-based check: catches bleed on SHORT rows where MT < 4 words.
-            # If EN is short (< 8 words) but output is 3x+ EN words and 6+ words
-            # longer, Gemini almost certainly pulled content from an adjacent row.
             _en_trigger = (_en_w >= 2 and _en_w < 8
                            and _out_w > _en_w * 3
                            and (_out_w - _en_w) >= 4)
-            # Tiny-row check: catches bleed on 1-2 word EN rows where the standard
-            # thresholds are too lenient. A 1-word row ("Yeah.") growing to 4 words
-            # has delta=3 which slips under the >=4 delta guard. For very short EN
-            # source rows (≤2 words), an absolute delta of +3 words is suspicious
-            # regardless of MT length — Gemini pulled content from an adjacent row.
-            # Example: EN="Yeah." (1w) → DE="Ja. Ich habe Hunger." (4w) = bleed.
-            # Example: EN="Busy where?" (2w) → DE="Beschäftigt wo denn? Und —" (5w) = bleed.
-            # NOT triggered: EN=2w → DE=4w (delta=2, legitimate expansion).
+            # Tiny-row check: catches bleed on 1-2 word EN rows.
             _tiny_trigger = (_en_w >= 1 and _en_w <= 2
                              and _out_w >= _en_w + 3)
-            if _mt_trigger or _en_trigger or _tiny_trigger:
+            if _mt_trigger or _en_primary_trigger or _en_trigger or _tiny_trigger:
                 _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
                 if _mt_orig:
-                    _trigger_src = "MT" if _mt_trigger else ("EN" if _en_trigger else "TINY")
+                    _trigger_src = ("MT" if _mt_trigger else
+                                    ("EN-PRIMARY" if _en_primary_trigger else
+                                     ("EN" if _en_trigger else "TINY")))
                     log(f"  \u26a0\ufe0f  Bleed guard: sort={_s} inflated ({_out_w}w vs MT={_inp_w}w EN={_en_w}w, trigger={_trigger_src}) \u2014 restored from MT")
                     _r["content"] = _mt_orig
                     _bleed_count += 1
@@ -3409,6 +3515,16 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
 
     # ── Post-processing + unified retry loop ─────────────────────────────
+    # Merge pre-batch source-align tags into _force_retry_sorts so unified_retry
+    # routes them through the EN-source bleed path (not the contaminated-MT truncated path).
+    for _sa_sort in _pre_batch_source_align:
+        if _sa_sort not in _force_retry_sorts:
+            _force_retry_sorts[_sa_sort] = 'source_align'
+        # If the trunc guard already tagged this sort (e.g. 'truncated'), override
+        # with 'source_align' so the correct retry prompt is used.
+        elif _force_retry_sorts[_sa_sort] == 'truncated':
+            _force_retry_sorts[_sa_sort] = 'source_align'
+
     # Run post-processing on initial Gemini output
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
     _post_process(sorted_rows, input_data, glossary_terms,
