@@ -648,7 +648,11 @@ _SV_CORE = (
     # aggiunse is already present; adding more commentary verbs:
     r"chiam\u00f2|comment\u00f2|esclam\u00f2|not\u00f2|conclud\u00e8|"
     r"ricord\u00f2|ricord\u00e8|ammise|confid\u00f2|ipotizz\u00f2|avanz\u00f2|"
-    r"osserv\u00f2|precis\u00f2|sottopose|enunci\u00f2|articol\u00f2"
+    r"osserv\u00f2|precis\u00f2|sottopose|enunci\u00f2|articol\u00f2|"
+    # Further common verbs absent from previous list (session 7)
+    # specific\u00f2 (specificare=to specify), puntualiz\u00f2 (to clarify/point out),
+    # ammutol\u00ec (to fall silent — used as attribution), sentenzi\u00f2 (to pronounce)
+    r"specific\u00f2|puntualiz\u00f2|ammutol\u00ec|sentenzi\u00f2"
 )
 # _SV: Full verb list for INLINE same-row attribution matching.
 # Context (same-row dialogue) makes ambiguity much lower here.
@@ -1768,7 +1772,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         _out_unquoted = re.sub(r'^[„“"]+', '', out).strip()
         _is_bgs_raw      = _is_begleitsatz(out)
         _is_bgs_unquoted = _is_begleitsatz(_out_unquoted)
-        if (_is_bgs_raw or _is_bgs_unquoted) and not _eng_is_attribution:
+        # Fix 3 (Image 6): Do NOT fire BGS guard when the output has an inverted
+        # SV:speech structure ("Affermò: È tutto finito."). This IS a valid row
+        # (attribution followed by colon then speech). A true BGS has no colon+uppercase.
+        _has_colon_speech = bool(re.search(r':\s+[A-ZÀÈÉÌÒÙ]', out))
+        if (_is_bgs_raw or _is_bgs_unquoted) and not _eng_is_attribution and not _has_colon_speech:
             row["content"] = mt_s
             _bgs_confusion_fixes += 1
             log(f"  ⚠️  BGS confusion: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
@@ -2065,17 +2073,21 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         m3 = re.search(r'[.!?…]\s+[A-Z]', text)
         if m3:
             return m3.start() + 1, False
-        # ── Priority 5: Short speech + comma + uppercase name ────────
+        # ── Priority 5: Short attribution + comma + uppercase name ────────
         # EN guard: only fire if EN source has attribution after its closing quote.
-        # If EN ends at its close quote (no attribution), a comma+uppercase word
-        # inside the Italian is a vocative or embedded name — not a speech boundary.
-        #   ✓ '"Sure," Mia replied.' → en_has_post_close → fire
-        #   ✗ '"Let me handle it, Hank."' → EN ends at " → suppress (Hank is vocative)
-        #   ✗ '"By the way, Joshua, has Iris...?"' → EN ends at " → suppress (Iris is mid-speech)
+        # POSITIONAL FIX (Image 1): original guard measured words BEFORE the match
+        # (words_before <= 4), which falsely fired on vocatives at the START of speech:
+        # "Caden, Gerry è ancora..." → Caden = 1 word before comma → wrongly fired.
+        # Correct signal is ATTRIBUTION LENGTH, which is always short (1–3 words).
+        # New guard: words AFTER the match must be <= 3.
+        #   ✓ '"Sure," Mia replied.' → 0 words after match → fire
+        #   ✓ '"Già," disse lui piano.' → 3 words after → fire
+        #   ✗ '"Caden, Gerry è ancora nei paraggi."' → 5 words after → suppress
+        #   ✗ '"By the way, Joshua, has Iris?"' → EN no post-close → suppress
         m4 = re.search(r',\s+([A-Z][a-zàèéìòù])', text)
-        if m4 and len(text[:m4.start()].split()) <= 4 and _en_has_post_close_attribution(eng):
+        if m4 and len(text[m4.end():].split()) <= 3 and _en_has_post_close_attribution(eng):
             return m4.start(), False
-        # ── Fallback: end of text ───────────────────────────────
+        # ── Fallback: end of text ────────────────────────────────────────────
         return len(text), False
 
     def _count_en_inline_attribution(eng):
@@ -2223,22 +2235,35 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         elif role == "open":
             # Attribution-start guard: if EN starts with speech quotes but the Italian
             # output starts with an attribution/speech verb, the speech content was
-            # displaced to an adjacent row. Injecting „ around attribution text produces
-            # malformed output (e.g. „warf Noreen sanft ein...). Skip quote injection.
-            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')\b', stripped, re.IGNORECASE):
-                log(f"  ⚠️  Quote reinject: sort={sort_n} role={role} — DE starts with "
+            # displaced to an adjacent row. Injecting " around attribution text produces
+            # malformed output. Skip quote injection.
+            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')', stripped, re.IGNORECASE):
+                log(f"  ⚠️  Quote reinject: sort={sort_n} role={role} — IT starts with "
                     f"attribution verb but EN starts with speech. Skipping quote injection.")
                 fixed = stripped
             elif en_starts_quote:
                 # Start-of-row opener
                 fixed = _QE_OPEN + stripped
             else:
-                # Mid-row open: narration + speech
+                # Mid-row open: narration + speech (e.g. "disse lui: speech")
                 pos = _find_speech_start(stripped)
                 if pos >= 0:
-                    fixed = stripped[:pos] + _QE_OPEN + stripped[pos:]
+                    # Fix 4 (Image 4): when _find_speech_start finds a colon position,
+                    # call _find_speech_end on the POST-COLON substring only.
+                    # Previously _find_speech_end got the FULL text, causing P0.2 to
+                    # find the last ? and wrap narration+speech as one unit.
+                    # Now: open-quote goes at pos; close-quote is found within speech_part.
+                    speech_part = stripped[pos:]
+                    narration   = stripped[:pos]
+                    if _en_has_post_close_attribution(eng):
+                        end_pos, needs_comma = _find_speech_end(speech_part, eng)
+                        inner = _italian_close_at(speech_part, end_pos, needs_comma)
+                        fixed = narration + _QE_OPEN + inner
+                    else:
+                        # No EN attribution after close → close at end of speech
+                        fixed = narration + _QE_OPEN + speech_part + _QE_CLOSE
                 else:
-                    # Fallback: keep original (Gemini’s placement, imperfect but better than none)
+                    # Fallback: keep original (Gemini\'s placement, imperfect but better than none)
                     pass
 
         elif role == "close":
