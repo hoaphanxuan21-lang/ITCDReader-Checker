@@ -61,14 +61,14 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("ITGEMINI_API_KEY_6", ""),
     os.environ.get("ITGEMINI_API_KEY_7", ""),
     os.environ.get("ITGEMINI_API_KEY_8", ""),
-    os.environ.get("ITGEMINI_API_KEY_12", ""),
+                os.environ.get("ITGEMINI_API_KEY_12", ""),
     os.environ.get("ITGEMINI_API_KEY_13", ""),
     os.environ.get("ITGEMINI_API_KEY_14", ""),
     os.environ.get("ITGEMINI_API_KEY_15", ""),
     os.environ.get("ITGEMINI_API_KEY_16", ""),
     os.environ.get("ITGEMINI_API_KEY_17", ""),
     os.environ.get("ITGEMINI_API_KEY_18", ""),
-    os.environ.get("ITGEMINI_API_KEY_21", ""),
+            os.environ.get("ITGEMINI_API_KEY_21", ""),
     os.environ.get("ITGEMINI_API_KEY_22", ""),
     os.environ.get("ITGEMINI_API_KEY_23", ""),
     os.environ.get("ITGEMINI_API_KEY_24", ""),
@@ -2712,7 +2712,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     MAX_RETRIES_429 = 3    # If 429 persists beyond 3 tries, RPD is likely exhausted — fail fast
 
     def _fix_json_strings(s):
-        """Fix literal newlines/tabs inside JSON string values."""
+        """Fix literal newlines/tabs inside JSON string values (Pass 1).
+
+        Handles: bare \\n, \\r, \\t inside string values that Gemini occasionally
+        emits when the Italian content contains line-breaks or tabs.
+        Does NOT fix unescaped double-quotes — that is handled by
+        _repair_content_quotes (Pass 2) below.
+        """
         result = []
         in_string = False
         escape_next = False
@@ -2736,83 +2742,68 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 result.append(ch)
         return ''.join(result)
 
-    def _build_prompt(batch_data, batch_num, total_batches, next_batch_first=None, register_block=''):
-        """Build the prompt string and clean batch data, shared by both providers."""
-        lookahead_note = ""
-        if next_batch_first is not None:
-            lookahead_note = (
-                "\n\nLOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):\n"
-                f"The row immediately following this batch starts with: {json.dumps(next_batch_first.get('content', ''), ensure_ascii=False)}"
-            )
-        clean_batch = [
-            {
-                "sort": r["sort"],
-                "original": r.get("original", ""),
-                "content": r["content"],
-            }
-            for r in batch_data
-        ]
-        quote_hints = []
-        for r in batch_data:
-            role = r.get("_quote_role", "both")
-            sort_n = r['sort']
-            if role == "open":
-                quote_hints.append(f'  sort {sort_n}: OPENS a multi-row dialogue — use " to open, NO closing " at end')
-            elif role == "close":
-                quote_hints.append(f'  sort {sort_n}: CLOSES a multi-row dialogue — NO opening ", but add closing " at end')
-            elif role == "middle":
-                quote_hints.append(f"  sort {sort_n}: MIDDLE of a multi-row dialogue — NO opening or closing quotes")
-        quote_hint_block = ""
-        if quote_hints:
-            quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
+    def _repair_content_quotes(s):
+        """Pass 2: repair unescaped double-quotes inside "content" field values.
 
-        # Filter glossary to only terms present in this batch's text — reduces prompt
-        # size dramatically and keeps
-        # the model focused on only the relevant terms rather than all 200+ entries.
-        batch_text = " ".join(
-            (r.get("original", "") + " " + r.get("content", "")).lower()
-            for r in batch_data
+        Root cause (2026-03-23): Gemini occasionally omits the backslash escape
+        on a straight double-quote that opens Italian dialogue, e.g.:
+
+            "content": ""Allora, signor Ward..."    ← unescaped opening "
+
+        The char-flip logic in _fix_json_strings cannot distinguish a legitimate
+        JSON closing quote from an unescaped content quote — it just flips the
+        in_string flag, producing the same broken string.
+
+        Strategy: anchor on the structural end of each JSON object.  In the
+        Gemini batch response every "content" value is the last field before
+        the closing brace, so the TRUE closing delimiter is always the "
+        immediately followed by \\s*\\n\\s*[}\\]] .  The regex uses a
+        non-greedy .*? with a lookahead for that structural anchor, which forces
+        the engine to skip over any unescaped inner quotes and stop only at the
+        correct structural close.  The captured raw value is then escaped
+        in one shot with a nested re.sub.
+
+        Ordering: MUST be called BEFORE _fix_json_strings, because
+        _fix_json_strings converts literal \\n → \\\\n, destroying the
+        structural \\n anchor that the lookahead depends on.
+        Safe: only fires after json.loads + _fix_json_strings have both failed,
+        so it never touches already-valid JSON.
+        """
+        def _escape_inner(m):
+            prefix  = m.group(1)   # '"content": "'
+            raw_val = m.group(2)   # everything inside the value (may contain bad ")
+            suffix  = m.group(3)   # the structural closing '"\\n  }'
+            # Escape every unescaped " inside raw_val
+            fixed_val = re.sub(r'(?<!\\)"', r'\\"', raw_val)
+            return prefix + fixed_val + suffix
+
+        # Pattern:
+        #   group 1 = '"content": "'     (opening marker)
+        #   group 2 = the value body     (non-greedy, DOTALL)
+        #   group 3 = '"\\s*\\n\\s*[}\\]]' (structural end-of-object anchor)
+        # The lookahead in group 3 forces .*? to skip inner " that are NOT
+        # followed by the structural anchor, landing correctly at the last "
+        # before the closing brace/bracket.
+        return re.sub(
+            r'("content":\s*")(.*?)("(?=\s*\n\s*[}\]]))',
+            _escape_inner,
+            s,
+            flags=re.DOTALL,
         )
-        if glossary_terms:
-            # Build a set of all English words present in the batch (lowercased)
-            # for efficient multi-word substring matching.
-            # batch_text is already lowercase from the join above.
-            def _term_in_batch(term):
-                key = (term.get("dictionaryKey") or "").strip().lower()
-                sur = (term.get("enSurname") or "").strip().lower()
-                return (key and key in batch_text) or (sur and sur in batch_text)
 
-            merged = [t for t in glossary_terms if _term_in_batch(t)]
-            # Fallback: if filter produces nothing (e.g. batch is all Italian already),
-            # send the full list so the model still has context.
-            if not merged:
-                merged = glossary_terms
-            batch_glossary_text = format_glossary_for_prompt(merged)
-        else:
-            merged = []
-            batch_glossary_text = glossary_text_full
-        log(f"  Glossary for batch {batch_num}: {len(merged)} relevant terms (of {len(glossary_terms or [])} total)")
-
-        prompt = (
-            f"{BASE_PROMPT}\n\n"
-            f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
-            f"{batch_glossary_text}\n\n"
-            f"{register_block}"
-            f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
-            f"For each row:\n"
-            f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
-            f"  - \"content\": Italian machine translation — this is what you MUST rephrase. "
-            f"Actively rephrase into polished, natural Italian: replace common verbs with literary alternatives, "
-            f"restructure clauses, add connective tissue, vary sentence openings. Aim for 35-50% word-level change. "
-            f"Returning a row IDENTICAL or near-identical to the input is a hard validation error — "
-            f"CDReader will reject the entire chapter. Every row must feel noticeably different.\n"
-            f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
-            f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
-        )
-        return prompt, clean_batch
 
     def _parse_llm_response(text, batch_num):
-        """Parse JSON from LLM response text, with fallback fix."""
+        """Parse JSON from LLM response text — three-tier fallback.
+
+        Tier 1: json.loads(text)               — happy path
+        Tier 2: json.loads(_fix_json_strings)  — bare newlines/tabs in values
+        Tier 3: json.loads(_repair_content_quotes(_fix_json_strings))
+                                               — unescaped " inside content values
+                                                 (e.g. Gemini omits escape on Italian
+                                                  dialogue-opening straight quote)
+        If all three tiers fail, re-raises json.JSONDecodeError for the outer handler
+        in _call_gemini, which logs the error and retries the batch.
+        """
         text = text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[-1]
@@ -2820,7 +2811,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
+            pass
+        try:
             return json.loads(_fix_json_strings(text))
+        except json.JSONDecodeError:
+            pass
+        # Tier 3: unescaped " repair — must run on raw text (real \n = anchor),
+        # then _fix_json_strings handles remaining literal control chars.
+        return json.loads(_fix_json_strings(_repair_content_quotes(text)))
+
 
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None, register_block=''):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first, register_block=register_block)
@@ -2925,7 +2924,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 return parsed
 
             except json.JSONDecodeError as e:
-                log(f"❌ Gemini JSON parse error on batch {batch_num}: {e}")
+                log(f"❌ Gemini JSON parse error on batch {batch_num} (finishReason={finish_reason}): {e}")
                 log(f"   Raw response (first 500 chars): {text[:500]}")
                 log(f"  Retrying in 15s...")
                 time.sleep(15)
