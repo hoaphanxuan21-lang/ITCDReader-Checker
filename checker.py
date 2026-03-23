@@ -1333,11 +1333,11 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
             new_content = result[0]["content"].strip()
             # EN-primary re-bleed guard: if Gemini still returned inflated content
             # despite the EN-source bleed prompt, restore from MT reference.
-            # Threshold matches batch Guard 2 EN-primary trigger (2.5x, delta>=4).
+            # Threshold matches batch Guard 2 EN-primary trigger (2.2x, delta>=4).
             _en_w_ur = len((_eng_by_sort_ur.get(sort_n) or "").split())
             _out_w_ur = len(new_content.split())
             if (_en_w_ur >= 3
-                    and _out_w_ur > _en_w_ur * 2.5
+                    and _out_w_ur > _en_w_ur * 2.2  # lowered 2.5→2.2 (matches batch guard)
                     and (_out_w_ur - _en_w_ur) >= 4):
                 log(f"    ⚠️  sort={sort_n}: retry re-bleed detected "
                     f"({_out_w_ur}w vs EN={_en_w_ur}w) — keeping MT")
@@ -2283,17 +2283,36 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                     f"attribution verb but EN starts with speech. Skipping quote injection.")
                 fixed = stripped
             elif en_starts_quote:
-                # Start-of-row both: " at start, " placed by _find_speech_end.
-                # Always call _find_speech_end regardless of _en_has_post_close_attribution
-                # so trailing narration bled into the row is not trapped inside quotes.
-                # Full-wrap only when pos == len(stripped) (pure speech, no boundary found).
-                pos, needs_comma = _find_speech_end(stripped, eng)
-                if pos < len(stripped):
-                    inner = _italian_close_at(stripped, pos, needs_comma)
-                    fixed = _QE_OPEN + inner
+                # Fix (Image 1 sort=93): Before calling _find_speech_end on the full
+                # stripped text, check if the text has an inverted SV:speech structure
+                # (e.g. "Gerry affermò: Sei l'unica in grado di guarirlo.").
+                # _find_speech_start detects the colon at the correct speech boundary.
+                # If found, apply the same post-colon logic as role=open (Fix 4, Session 7):
+                # pass only the speech_part to _find_speech_end, not the full text.
+                # Without this, P3 fires on the SV verb (affermò) treating the name
+                # before it ("Gerry") as the speech content — producing "Gerry," affermò: ...
+                _sp_start_both = _find_speech_start(stripped)
+                if _sp_start_both >= 0:
+                    # Inverted structure: narration + SV + colon + speech
+                    _narr_both   = stripped[:_sp_start_both]
+                    _speech_both = stripped[_sp_start_both:]
+                    if _en_has_post_close_attribution(eng):
+                        _ep_both, _nc_both = _find_speech_end(_speech_both, eng)
+                        _inner_both = _italian_close_at(_speech_both, _ep_both, _nc_both)
+                        fixed = _narr_both + _QE_OPEN + _inner_both
+                    else:
+                        fixed = _narr_both + _QE_OPEN + _speech_both + _QE_CLOSE
                 else:
-                    # No boundary found — pure speech row, close at end
-                    fixed = _QE_OPEN + stripped + _QE_CLOSE
+                    # Standard path: EN starts with quote, no inverted colon structure
+                    # Always call _find_speech_end regardless of _en_has_post_close_attribution
+                    # so trailing narration is not trapped inside quotes.
+                    pos, needs_comma = _find_speech_end(stripped, eng)
+                    if pos < len(stripped):
+                        inner = _italian_close_at(stripped, pos, needs_comma)
+                        fixed = _QE_OPEN + inner
+                    else:
+                        # No boundary found — pure speech row, close at end
+                        fixed = _QE_OPEN + stripped + _QE_CLOSE
             else:
                 # Mid-row both: narration + „speech“ + possible attribution
                 start_pos = _find_speech_start(stripped)
@@ -2546,16 +2565,20 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                     comma_fixes += 1
 
         # Rule C: Add missing comma inside close-quote when followed by attribution.
-        # Italian: \u201cTesto,\u201d disse. (comma BEFORE close-quote)
-        # Cross-row: row ends with \u201d (no comma before it) and next IS attribution.
+        # Italian: "Testo," disse. (comma BEFORE close-quote)
+        # Cross-row: row ends with " (no comma before it) and next IS attribution.
+        # SUPPRESSION: Do NOT add comma when the char before the close-quote is ?/!/.
+        # Italian never writes "Testo?," or "Testo!," — terminal punct stands alone.
         elif c and c.rstrip().endswith('"') and not c.rstrip().endswith(',"'):
-            if _is_continuation_row(next_content):
-                _c_s = c.rstrip()
-                row["content"] = _c_s[:-1] + ',"'
+            _c_s_rule_c = c.rstrip()
+            _pre_close_char = _c_s_rule_c[-2] if len(_c_s_rule_c) >= 2 else ''
+            if _is_continuation_row(next_content) and _pre_close_char not in '.!?…':
+                row["content"] = _c_s_rule_c[:-1] + ',"'
                 c = row["content"]
                 comma_adds += 1
         elif c and c[-1] in ('"', '"') and not c.rstrip()[-2:-1] == ',':
-            if _is_continuation_row(next_content):
+            _pre_close_char2 = c.rstrip()[-2] if len(c.rstrip()) >= 2 else ''
+            if _is_continuation_row(next_content) and _pre_close_char2 not in '.!?…':
                 # Fallback for non-standard quote chars: insert comma before close
                 row["content"] = c[:-1] + ',' + c[-1]
                 c = row["content"]
@@ -3396,10 +3419,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             # MT is contaminated and far longer than EN. Standard MT-based trigger is
             # blind because MT word count already includes the bled content. Using EN
             # as the reference catches re-bleed in retry (sort=21: EN=4w, retry=27w).
-            # Threshold 2.5x EN with delta>=4: allows legitimate IT expansion (10w→14w)
-            # but catches 4w→27w re-bleed.
+            # Threshold 2.2x EN with delta>=4: allows legitimate IT expansion (10w→14w)
+            # but catches 5w→12w bleed (sort=97) and 4w→27w re-bleed (sort=21).
             _en_primary_trigger = (_en_w >= 3
-                                   and _out_w > _en_w * 2.5
+                                   and _out_w > _en_w * 2.2  # lowered 2.5→2.2 (catches sort=97: 12>5*2.2=11)
                                    and (_out_w - _en_w) >= 4)
             # EN-based check: catches bleed on SHORT rows where MT < 4 words.
             _en_trigger = (_en_w >= 2 and _en_w < 8
