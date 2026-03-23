@@ -85,6 +85,7 @@ _GEMINI_KEYS_RAW = [
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
 _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for this run)
+_403_excluded_keys: set = set()   # D2: 403-excluded keys — suspended/forbidden, skip for entire run
 
 # Gemini keys use ITGEMINI_API_KEY naming to avoid collision with German pipeline.
 # Per-key last-used timestamps for cooldown tracking (Option 1).
@@ -172,10 +173,10 @@ def _next_gemini_key(prefer_group=None):
     if prefer_group is not None and 0 <= prefer_group < len(_ACCOUNT_GROUPS):
         # Try preferred group first
         for k in _ACCOUNT_GROUPS[prefer_group]:
-            if k in GEMINI_KEYS and k not in _exhausted_keys and k not in _rpd_exhausted_keys:
+            if k in GEMINI_KEYS and k not in _exhausted_keys and k not in _rpd_exhausted_keys and k not in _403_excluded_keys:
                 return k
     # Fall through: try all groups in order
-    available = [k for k in GEMINI_KEYS if k not in _exhausted_keys and k not in _rpd_exhausted_keys]
+    available = [k for k in GEMINI_KEYS if k not in _exhausted_keys and k not in _rpd_exhausted_keys and k not in _403_excluded_keys]
     return available[0] if available else None
 
 def _all_keys_rpd_dead():
@@ -987,6 +988,17 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             except Exception:
                 pass
             return None, is_rpd, not is_rpd
+        # D2: 403 Forbidden — key suspended, revoked, or billing issue.
+        # Unlike 429 (RPM/RPD) which is transient, 403 means the key is permanently
+        # dead for this run. Exclude immediately so rotation never wastes time on it.
+        if resp.status_code == 403:
+            _403_excluded_keys.add(api_key)
+            try:
+                err_msg = resp.json().get("error", {}).get("message", "")[:80]
+            except Exception:
+                err_msg = ""
+            log(f"    🚫 403 Forbidden: key excluded for this run [{err_msg}]")
+            return None, False, False   # caller will try next key/group
         resp.raise_for_status()
         body = resp.json()
         candidates = body.get("candidates", [])
@@ -1021,7 +1033,8 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         if gi in _rpm_blocked_groups:
             continue
         group_keys = [k for k in _ACCOUNT_GROUPS[gi]
-                      if k in keys_all and k not in _rpd_exhausted_keys]
+                      if k in keys_all and k not in _rpd_exhausted_keys
+                      and k not in _403_excluded_keys]
         if not group_keys:
             continue
 
@@ -1050,10 +1063,12 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         return None  # wall-clock deadline exceeded before second pass
 
     available_keys = [k for k in keys_all if k not in _rpd_exhausted_keys
+                      and k not in _403_excluded_keys
                       and _key_account_group(k) not in _rpm_blocked_groups]
     if not available_keys:
         # All groups either RPM-blocked or RPD-dead — try waiting for the soonest key
-        available_keys = [k for k in keys_all if k not in _rpd_exhausted_keys]
+        available_keys = [k for k in keys_all if k not in _rpd_exhausted_keys
+                          and k not in _403_excluded_keys]
 
     if available_keys:
         now = time.time()
@@ -1199,12 +1214,13 @@ def _unified_retry(all_rephrased, input_data, rows):
 
         if "truncated" in reason:
             prompt = (
-                "Sei un correttore italiano. "
-                "La riga seguente è stata tagliata troppo ed è incompleta. "
-                "Riformula il testo italiano COMPLETO "
-                "— conserva tutti i contenuti e significati. NON abbreviare.\n"
+                "Sei un editor italiano esperto. "
+                "La riga seguente è stata troncata ed è incompleta. "
+                "Riscrivi il testo italiano COMPLETO con 2-3 miglioramenti redazionali "
+                "— verbi più precisi, connettivi più naturali, apertura di frase variata. "
+                "Conserva tutti i contenuti e significati. NON abbreviare.\n"
                 "Rispondi SOLO con: "
-                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<vollständig umformuliert>\"}]\n"
+                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<testo completo e migliorato>\"}]\n"
                 + json.dumps([{"sort": sort_n, "content": ref_text}], ensure_ascii=False)
             )
             temp = 0.5
@@ -1217,19 +1233,21 @@ def _unified_retry(all_rephrased, input_data, rows):
                 _swap_instruction = (
                     f"OBBLIGO: Nella tua risposta sostituisci esattamente la parola "
                     f"\u00bb{_swap[0]}\u00ab con \u00bb{_swap[1]}\u00ab. "
-                    f"Adatta articoli/preposizioni se necessario. Lascia tutto il resto invariato.\n"
+                    f"Adatta articoli/preposizioni se necessario.\n"
                 )
             else:
                 _swap_instruction = (
-                    "OBBLIGO: Modifica almeno una parola — "
+                    "OBBLIGO: Apporta 2-3 miglioramenti concreti — "
                     "NON restituire la stessa frase.\n"
                 )
             prompt = (
-                "Sei un correttore italiano. La frase seguente \u00e8 troppo simile al "
-                "testo di riferimento e deve essere modificata.\n"
+                "Sei un editor italiano esperto. La frase seguente è troppo simile al "
+                "testo di riferimento. Apporta 2-3 miglioramenti redazionali significativi: "
+                "precisione verbale, ristrutturazione della frase, connettivi più naturali, "
+                "adattamento idiomatico. Il risultato deve sembrare scritto da un madrelingua.\n"
                 + _swap_instruction +
                 "Rispondi SOLO con: "
-                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<corretto>\"}]\n"
+                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<migliorato>\"}]\n"
                 + json.dumps([{"sort": sort_n, "reference": ref_text, "content": current_out}],
                              ensure_ascii=False)
             )
@@ -1241,18 +1259,20 @@ def _unified_retry(all_rephrased, input_data, rows):
                 _swap_instruction = (
                     f"OBBLIGO: Nella tua risposta sostituisci esattamente la parola "
                     f"\u00bb{_swap[0]}\u00ab con \u00bb{_swap[1]}\u00ab. "
-                    f"Adatta articoli/preposizioni se necessario. Lascia tutto il resto invariato.\n"
+                    f"Adatta articoli/preposizioni se necessario.\n"
                 )
             else:
                 _swap_instruction = (
-                    "OBBLIGO: Modifica almeno una parola — "
+                    "OBBLIGO: Apporta 2-3 miglioramenti concreti — "
                     "NON restituire la stessa frase.\n"
                 )
             prompt = (
-                "Sei un correttore italiano. Questa frase è identica al testo di input "
-                "e deve essere modificata.\n"
+                "Sei un editor italiano esperto. Questa frase è identica al testo di input "
+                "e deve essere migliorata. Apporta 2-3 modifiche redazionali significative: "
+                "precisione verbale, ristrutturazione della frase, connettivi più naturali. "
+                "Il risultato deve suonare autentico per un lettore madrelingua.\n"
                 + _swap_instruction +
-                "Rispondi SOLO con: [{\"sort\": " + str(sort_n) + ", \"content\": \"<corretto>\"}]\n"
+                "Rispondi SOLO con: [{\"sort\": " + str(sort_n) + ", \"content\": \"<migliorato>\"}]\n"
                 + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
             )
             temp = 0.5
@@ -1319,48 +1339,46 @@ def _unified_retry(all_rephrased, input_data, rows):
 
 # ─── Remedy A: Force-retry pass for trunc-guard rows ─────────────────────────
 _FORCE_RETRY_PROMPT = (
-    "You are an Italian MT post-editor. The previous output for this row was discarded "
-    "because it was too short or truncated.\n\n"
+    "You are an experienced Italian editor working on machine-translated fiction. "
+    "The previous output for this row was discarded because it was too short or truncated.\n\n"
     "ENGLISH SOURCE:\n{en_source}\n\n"
     "MACHINE TRANSLATION (Italian):\n{mt_content}\n\n"
-    "Produce a correct, complete Italian post-edit of this row. Apply all standard rules: "
-    "fix grammar, register, localization (Dollar\u2192Euro, CEO\u2192amministratore delegato). "
-    "If the machine translation is already correct, produce the same meaning in a naturally "
-    "fluent Italian formulation.\n\n"
-    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected Italian text"}}'
+    "Produce a correct, complete Italian post-edit of this row. Apply 2-3 meaningful "
+    "editorial improvements: more precise verbs, better sentence flow, idiomatic phrasing. "
+    "Fix grammar, register, localization (Dollar\u2192Euro, CEO\u2192amministratore delegato). "
+    "The result must read like native Italian fiction, not a translation.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "improved Italian text"}}'
 )
 
 _FORCE_RETRY_PROMPT_BLEED = (
-    "You are an Italian MT post-editor. The previous output for this row was discarded "
-    "because it contained content from an adjacent row (cross-row bleed: Gemini merged "
-    "speech from sort N+1 into sort N, leaving sort N+1 with attribution-only content, "
-    "or vice versa).\n\n"
+    "You are an experienced Italian editor working on machine-translated fiction. "
+    "The previous output for this row was discarded because it contained content from "
+    "an adjacent row (cross-row bleed: Gemini merged speech from sort N+1 into sort N, "
+    "or left sort N+1 with only attribution content).\n\n"
     "ENGLISH SOURCE:\n{en_source}\n\n"
     "MACHINE TRANSLATION (Italian):\n{mt_content}\n\n"
-    "Produce a correct, complete Italian post-edit of THIS ROW ONLY — its own content, "
-    "nothing borrowed from adjacent rows. "
-    "Apply all standard rules: fix grammar, register, "
-    "localization (Dollar->Euro, CEO->amministratore delegato). "
-    "If the machine translation is already correct, produce the same meaning in a "
-    "naturally fluent Italian formulation that differs from the MT.\n\n"
-    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected Italian text"}}'
+    "Produce a correct, complete Italian post-edit of THIS ROW ONLY \u2014 its own content, "
+    "nothing borrowed from adjacent rows. Apply 2-3 meaningful editorial improvements: "
+    "more precise verbs, better sentence flow, idiomatic phrasing. "
+    "Fix grammar, register, localization (Dollar->Euro, CEO->amministratore delegato). "
+    "The result must read like native Italian fiction.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "improved Italian text"}}'
 )
 
 _FORCE_RETRY_PROMPT_BGS = (
-    "You are an Italian MT post-editor. The previous output for this row was discarded "
-    "because it contained only a bare attribution clause (attribution clause) instead of the "
-    "full dialogue or narrative content this row requires.\n\n"
+    "You are an experienced Italian editor working on machine-translated fiction. "
+    "The previous output for this row was discarded because it contained only a bare "
+    "attribution clause instead of the full dialogue or narrative content this row requires.\n\n"
     "ENGLISH SOURCE:\n{en_source}\n\n"
     "MACHINE TRANSLATION (Italian):\n{mt_content}\n\n"
     "Produce a correct, complete Italian post-edit of THIS ROW. "
-    "The row must contain its own full content - do not output a standalone attribution "
-    "such as disse lui or chiese lei unless the English source itself is only an "
-    "attribution clause. "
-    "Apply all standard rules: fix grammar, register, "
-    "localization (Dollar->Euro, CEO->amministratore delegato). "
-    "If the machine translation is already correct, produce the same meaning in a "
-    "naturally fluent Italian formulation that differs from the MT.\n\n"
-    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected Italian text"}}'
+    "The row must contain its own full content \u2014 do not output a standalone attribution "
+    "such as \'disse lui\' or \'chiese lei\' unless the English source itself is only an "
+    "attribution clause. Apply 2-3 meaningful editorial improvements: more precise verbs, "
+    "better sentence flow, idiomatic phrasing. "
+    "Fix grammar, register, localization (Dollar->Euro, CEO->amministratore delegato). "
+    "The result must read like native Italian fiction.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "improved Italian text"}}'
 )
 
 
@@ -1455,18 +1473,19 @@ _RECOVERY_MAX_ROWS = 15
 _RECOVERY_SIM_THRESHOLD = 0.80  # wider net than SIM_THRESHOLD — Italian CDReader is stricter
 
 _RECOVERY_PROMPT = (
-    "You are an Italian MT post-editor performing an urgent quality correction.\n\n"
+    "You are an experienced Italian editor working on machine-translated fiction. "
+    "This chapter was rejected because the following row is too similar to the original machine translation.\n\n"
     "ENGLISH SOURCE:\n{en_source}\n\n"
     "MACHINE TRANSLATION (Italian):\n{mt_content}\n\n"
     "CURRENT SAVED TEXT (similarity to MT: {sim_pct}% \u2014 chapter finish rejected):\n{saved_content}\n\n"
-    "The chapter was rejected because this row is too similar to the original machine translation.\n"
+    "Apply 2-3 meaningful editorial improvements to this row: more precise verbs, "
+    "better sentence flow, idiomatic phrasing, varied sentence opening. "
     "- If you find a real error (article agreement, wrong conjugation, tense "
     "inconsistency, register violation, localization missing): correct it.\n"
-    "- If the text is genuinely correct, produce a natural alternative formulation with the "
-    "same meaning \u2014 different word order, a more precise expression, or a restructured clause.\n"
     "- The output MUST differ from the current saved text by more than a single word.\n"
+    "- The result must read like native Italian fiction, not a translation.\n"
     "- Do NOT make changes that would surprise a native Italian reader or alter the meaning.\n\n"
-    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected Italian text"}}'
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "improved Italian text"}}'
 )
 
 
@@ -1675,6 +1694,34 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
             row["content"] = mt_s
             _bgs_confusion_fixes += 1
             log(f"  ⚠️  Lowercase-first displaced: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
+            continue
+        # Fix 3c: EN-reference lowercase guard.
+        # Root cause (Image 1): CDReader's MT itself can carry a boundary error — the
+        # Italian machine translation for row N already includes row N+1's content, so
+        # the MT for row N+1 also starts lowercase. Fix 3b is blind to this because it
+        # checks (out_lc AND mt_uc): if MT also starts lowercase, the guard never fires.
+        # Solution: use the English source as the reference instead of MT.
+        # EN is generated independently from the Chinese source and will NOT carry the
+        # same CDReader MT boundary error.
+        # Conditions (all must hold):
+        #   1. output starts lowercase (displaced content signature)
+        #   2. EN source starts uppercase (confirms row should begin a new sentence)
+        #   3. EN source does NOT start with '"' (dialogue rows can legitimately start lc
+        #      after quote stripping — those are handled by Quote Reinject, not here)
+        #   4. output has >= 4 words (avoids false positives on short lc continuation
+        #      fragments or proper nouns CDReader occasionally mislabels)
+        # Action: restore from MT and queue for force-retry so the retry call receives
+        # single-row context; the EN source gives Gemini the correct starting reference.
+        _eng_uc_start = bool(eng_s and eng_s.strip() and eng_s.strip()[0].isupper())
+        _eng_no_quote = not eng_s.strip().startswith('"')
+        _out_lc_3c    = bool(out and out[0].islower())
+        _out_long_3c  = len(out.split()) >= 4
+        if _out_lc_3c and _eng_uc_start and _eng_no_quote and _out_long_3c:
+            row["content"] = mt_s
+            _bgs_confusion_fixes += 1
+            log(f"  ⚠️  Fix3c EN-ref lc: sort={sort_n} out_lc+eng_uc — restored from MT {mt_s[:60]!r}")
+            if force_retry_sorts is not None:
+                force_retry_sorts[sort_n] = 'bleed'
     if _bgs_confusion_fixes:
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
 
@@ -1850,9 +1897,18 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 return m.start(), False
             # else: boundary+non-SV word precedes the verb → fall through to Priority 4
         # ── Priority 3: SV verb without comma ───────────────────────
+        # BOUNDARY GUARD (mirrors Priority 2): if a sentence-ending [?!] followed
+        # by an uppercase non-SV word appears BEFORE the SV match position, the
+        # speech ended at that boundary and the SV verb belongs to narration.
+        #   ✓ '"Fermati" disse.' → no boundary before disse → fire
+        #   ✗ '"Ci sei? Hank scosse la testa disse.' → ? + Hank before disse → defer to P4
         m2 = re.search(r'(?<=[a-zàèéìòù!?.…])\s+(' + _SV + r')\b', text, re.IGNORECASE)
         if m2:
-            return m2.start(), True
+            _pre_sv3 = text[:m2.start()]
+            _bound3 = re.search(r'[?!]\s+([A-Z][a-zA-Zàèéìòù]*)', _pre_sv3)
+            if not (_bound3 and not re.match(r'^(?:' + _SV + r')$', _bound3.group(1), re.IGNORECASE)):
+                return m2.start(), True
+            # else: boundary+non-SV word precedes the verb → fall through to Priority 4
         # ── Priority 3.5: Structural attribution fallback ─────────────
         # Catches attribution verbs NOT in _SV by matching the Italian
         # attribution structure:  , [lowercase-verb] [Name/pronoun]
@@ -2271,6 +2327,27 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
 
     if _dup_fixes:
         log(f"  🔁 Post-processing: fixed {_dup_fixes} duplicate content row(s).")
+
+    # ── Fix PUNCT-DEDUP: collapse repeated terminal punctuation ──────────────
+    # Gemini occasionally outputs ?? or !! (double/triple question/exclamation marks).
+    # Normalise to single char BEFORE comma rules run so Rule C2/F receive clean input.
+    # Pattern: ([?!])\1+  →  \1   (collapses ?? → ?, !! → !, ??? → ?, etc.)
+    _pdedup_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        c = row.get("content", "")
+        if not c:
+            continue
+        c_dedup = re.sub(r'([?!])\1+', r'\1', c)
+        if c_dedup != c:
+            row["content"] = c_dedup
+            c = c_dedup
+            _pdedup_fixes += 1
+            log(f"  ⚠️  Punct-dedup: sort={sort_n} collapsed repeated terminal punct: {c!r}")
+    if _pdedup_fixes:
+        log(f"  💬 Punct-dedup: normalised {_pdedup_fixes} row(s) with repeated ?/!")
 
     for idx, row in enumerate(sorted_rows):
         c = row.get("content", "")
@@ -2981,6 +3058,19 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                         remaining = len([k for k in GEMINI_KEYS if k not in _exhausted_keys])
                         log(f"  🔄 Key RPM-limited{limit_hint}, {remaining} key(s) remaining...")
                     continue
+                # D2: 403 Forbidden in batch path — key suspended/revoked.
+                # Exclude permanently for this run, rotate to next key in the batch loop.
+                if resp.status_code == 403:
+                    _403_excluded_keys.add(api_key)
+                    try:
+                        err_msg_403 = resp.json().get("error", {}).get("message", "")[:80]
+                    except Exception:
+                        err_msg_403 = ""
+                    remaining_403 = len([k for k in GEMINI_KEYS if k not in _403_excluded_keys
+                                         and k not in _rpd_exhausted_keys])
+                    log(f"  🚫 403 Forbidden on batch {batch_num}: key excluded for run "
+                        f"[{err_msg_403}]. {remaining_403} key(s) still available.")
+                    continue
                 resp.raise_for_status()
                 body = resp.json()
 
@@ -3217,6 +3307,22 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     _cascade_count += 1
         if _trunc_count or _cascade_count:
             log(f"  💬 Trunc guard: {_trunc_count} truncated + {_cascade_count} cascade neighbour(s) restored from MT (will retry).")
+        # ── Diagnostic: CDReader source alignment anomalies ──────────────────
+        # Rows where the Italian MT is 3x+ longer than the English source are
+        # almost always a CDReader data-alignment error (EN field contains just
+        # one short line while MT spans a merged multi-sentence block, or vice versa).
+        # These rows are handled correctly by the trunc guard and Gemini (it follows
+        # the EN length), but they are worth logging for monitoring purposes.
+        for _r in result:
+            _s_diag = _r.get("sort")
+            if not _s_diag:
+                continue
+            _en_w_d  = _en_wc.get(_s_diag, 0)
+            _mt_w_d  = _inp_wc.get(_s_diag, 0)
+            if _en_w_d >= 1 and _mt_w_d >= 1 and (_mt_w_d / _en_w_d) >= 3.0 and _mt_w_d >= 6:
+                _en_preview = next((r.get("original","")[:50] for r in batch if r.get("sort")==_s_diag), "")
+                log(f"  ℹ️  Source-align anomaly: sort={_s_diag} MT={_mt_w_d}w vs EN={_en_w_d}w "
+                    f"(ratio={_mt_w_d/_en_w_d:.1f}x) — EN: {_en_preview!r}")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -3918,9 +4024,9 @@ def _run_inner(token):
             # Single-row retry via Gemini
             retry_result = None
             single_prompt = (
-            "Sei un correttore italiano. Apporta una MINIMA modifica a questa frase — "
-            "sostituisci una singola parola con un sinonimo o correggi un articolo. "
-            "NON modificare la struttura della frase.\n"
+            "Sei un editor italiano esperto. Apporta 2-3 miglioramenti redazionali a questa frase: "
+            "verbi più precisi, connettivi più naturali, apertura di frase variata, o adattamento idiomatico. "
+            "Il risultato deve suonare autentico per un lettore madrelingua.\n"
             "Rispondi SOLO con un array JSON: "
             "[{\"sort\": " + str(sort_n) + ", \"content\": \"...\"}]\n"
             + json.dumps([{"sort": sort_n, "content": single_batch[0]["content"]}], ensure_ascii=False)
