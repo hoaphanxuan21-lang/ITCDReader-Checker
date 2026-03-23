@@ -322,6 +322,11 @@ Register correction:
   3. Cascade rule — never mix pronoun forms within the same register:
      tu-register:  ti / te / tuo / tua / tuoi / tue
      Lei-register: Le / Suo / Sua / Suoi / Sue (all capitalized)
+  4. Proclitic placement (CRITICAL): Lei-register pronouns ALWAYS precede the verb.
+     CORRECT:   "Le prometto che..." / "Le dico che..." / "La ringrazio..."
+     INCORRECT: "PromettoLe che..." / "DiceLe che..." / "RingrazieLa..."
+     Enclitic attachment to indicative-mood verbs is archaic — never use it in modern fiction.
+     Exception: infinitives and imperatives retain enclitic forms ("Dirle", "Farlo", "Dimmelo").
 
 FINAL SELF-CHECK (perform before responding)
 1. Does my output have EXACTLY the same number of JSON objects as the input rows?
@@ -1703,14 +1708,19 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         _wc_mt_n   = len(_mt_n.split())
         _wc_out_n1 = len(_out_n1.split())
         _wc_mt_n1  = len(_mt_n1.split())
-        _inflated  = (_wc_mt_n >= 2
+        _inflated  = (_wc_mt_n >= 1               # P2: lowered from 2 — catches single-word rows (e.g. '"Certo."')
                       and _wc_out_n > _wc_mt_n * 1.3
                       and (_wc_out_n - _wc_mt_n) >= 2)
         _starts_lc = bool(_out_n1 and _out_n1[0].islower())
         _deflated  = (_wc_mt_n1 >= 3 and _wc_out_n1 < _wc_mt_n1 * 0.6)
-        if _inflated and _starts_lc and _deflated:
+        _shorter   = (_wc_out_n1 < _wc_mt_n1)     # P3: N+1 lost any words (partial bleed)
+        # P3: condition relaxed — fires when N is inflated AND either:
+        #   (a) N+1 is heavily deflated (<60% MT words) — any bleed regardless of lc
+        #   (b) N+1 starts lowercase AND is shorter than MT — partial bleed (bled words
+        #       didn't fully deplete N+1 but did remove its opening content)
+        if _inflated and (_deflated or (_starts_lc and _shorter)):
             log(f"  ⚠️ Cross-row bleed: sort={_sn} ({_wc_mt_n}→{_wc_out_n}w) "
-                f"+ sort={_sn1} lc-start ({_wc_mt_n1}→{_wc_out_n1}w) — restoring both from MT")
+                f"+ sort={_sn1} lc={_starts_lc} deflated={_deflated} ({_wc_mt_n1}→{_wc_out_n1}w) — restoring both from MT")
             _row_n['content']  = _mt_n
             _row_n1['content'] = _mt_n1
             _bleed_fixes += 1
