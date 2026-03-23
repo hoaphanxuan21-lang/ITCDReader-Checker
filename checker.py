@@ -642,7 +642,13 @@ _SV_CORE = (
     # Absent from previous list; caused fallback-to-end-of-text quote wrapping (Image 2).
     r"propose|sugger\u00ec|"
     # Verbs of coaxing/flattering with object-pronoun construction (lo blandì, la sedusse…)
-    r"bland\u00ec|sedusse|lusingò"
+    r"bland\u00ec|sedusse|lusingò|"
+    # Verbs of calling out / commenting — frequently used in fiction, absent from previous list.
+    # chiamò (chiamare = to call out), commentò (commentare = to comment/remark)
+    # aggiunse is already present; adding more commentary verbs:
+    r"chiam\u00f2|comment\u00f2|esclam\u00f2|not\u00f2|conclud\u00e8|"
+    r"ricord\u00f2|ricord\u00e8|ammise|confid\u00f2|ipotizz\u00f2|avanz\u00f2|"
+    r"osserv\u00f2|precis\u00f2|sottopose|enunci\u00f2|articol\u00f2"
 )
 # _SV: Full verb list for INLINE same-row attribution matching.
 # Context (same-row dialogue) makes ambiguity much lower here.
@@ -1691,7 +1697,14 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         if not c:
             continue
         # Collapse tabs, carriage returns, non-breaking spaces, and multi-space runs
-        c_ws = re.sub(r'[\t\r\u00a0]|[ ]{2,}', ' ', c).strip()
+        # Fix 3: [^\S\n] matches ALL whitespace chars that are not newlines, covering:
+        # U+0009 TAB, U+00A0 NBSP, U+202F NARROW NBSP, U+2009 THIN SPACE,
+        # U+200A HAIR SPACE, U+2002 EN SPACE, U+2003 EM SPACE, U+2005–U+2007 etc.
+        # CDReader renders any of these as visible '·' separators.
+        # The two-step replace: first normalise all unusual whitespace to regular space,
+        # then collapse any resulting multi-space runs.
+        c_ws = re.sub(r'[^\S\n]', ' ', c)
+        c_ws = re.sub(r' {2,}', ' ', c_ws).strip()
         if c_ws != c:
             row["content"] = c_ws
             _ws_fixes += 1
@@ -1937,6 +1950,30 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         if m_sq:
             return m_sq.start() + 1, False  # “ after punct, before comma
         # ── Priority 0.5: Em-dash speech-end guard (checker-27 Fix 1) ──────
+        # ── Priority 0.2: EN-terminal-punct mirroring ─────────────────────
+        # When EN speech closes with '!' or '?' immediately before the close-quote
+        # character (e.g. '"Alicia!" Caden called...'), find the LAST matching
+        # punctuation character in the Italian text and place the close-quote there.
+        # This is VERB-LIST-INDEPENDENT: works even when the attribution verb is absent
+        # from _SV (e.g. chiam\u00f2, comment\u00f2 before they were added to the list).
+        #
+        # Fix 6 guard: only fires when EN has post-close attribution (content after
+        # the close-quote). Pure-speech rows like '"Alicia!"' are handled by the
+        # full-wrap fallback and should not be affected.
+        #
+        #   \u2713 '"Alicia!" Caden called...' \u2192 EN has attribution \u2192 fire \u2192 IT: "Alicia!" chiam\u00f2 Caden...
+        #   \u2713 '"No! Never!" she cried'  \u2192 finds LAST '!' \u2192 "No! Never!" ...
+        #   \u2717 '"Alicia!"' (pure speech)  \u2192 guard suppresses \u2192 skip
+        if eng:
+            _en_tp = re.search(r'([?!])["\u201c\u201d\u201e]', eng)
+            if _en_tp:
+                _after_close = eng[_en_tp.end():].strip()
+                if _after_close:
+                    _target_char = _en_tp.group(1)
+                    _all_tp = list(re.finditer(re.escape(_target_char), text))
+                    if _all_tp:
+                        _tp_pos = _all_tp[-1].end()  # position after last matching punct
+                        return _tp_pos, False  # !/" and ?/" never take a comma
         # When the EN source has a dash (\u2013 or \u2014) immediately before
         # the closing quote (e.g. 'I prefer\u2014" Her cheeks turned pink.'),
         # the closing \u201d belongs right after the dash in Italian. Without
@@ -2010,6 +2047,20 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         )
         if m_struct:
             return m_struct.start(), False
+        # ── Priority 3.5b: Verb-final attribution (no explicit subject) ──
+        # Handles: ", commentò."  ", riprese."  ", aggiunse."
+        # The existing P3.5 requires a name/pronoun AFTER the verb; this sub-case
+        # catches single-verb attributions at sentence end: verb is the LAST word
+        # before the sentence-final period (or end-of-text).
+        # Guard: verb must end in passato remoto suffix AND be at/near end of text
+        # (no additional words after it except possible final punct).
+        # This avoids false positives on verbs mid-sentence.
+        m_struct_final = re.search(
+            r',\s+' + _PR_SUFFIX + r'[,.]?\s*$',
+            text
+        )
+        if m_struct_final:
+            return m_struct_final.start(), False
         # ── Priority 4: Sentence boundary (.!? + uppercase) ───────────
         m3 = re.search(r'[.!?…]\s+[A-Z]', text)
         if m3:
@@ -2103,7 +2154,13 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         """
         speech = stripped[:pos]
         rest = stripped[pos:]
-        if needs_comma:
+        # Fix 4: suppress comma when speech ends with sentence-final punctuation.
+        # Italian never writes '!," or '?,' — those end the speech cleanly.
+        # needs_comma is only meaningful when the speech ends with a word character.
+        _terminal_punct = ('.', '!', '?', '…', '\u2026')
+        _speech_end = speech.rstrip()[-1] if speech.rstrip() else ''
+        _suppress_comma = _speech_end in _terminal_punct
+        if needs_comma and not _suppress_comma:
             # No comma in stripped text — add comma before close quote
             return speech + ',' + _QE_CLOSE + ' ' + rest.lstrip()
         elif rest and rest[0] == ',':
@@ -2111,8 +2168,8 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
             # Move it before the close quote: speech + , + " + rest_after_comma
             return speech + ',' + _QE_CLOSE + rest[1:]
         else:
-            # No attribution / end of text — just close
-            return speech + _QE_CLOSE + rest
+            # No attribution / end of text / terminal punct — just close
+            return speech + _QE_CLOSE + ('' if not rest or rest[0] == ' ' else ' ') + rest.lstrip()
 
         # _QE_OPEN and _QE_CLOSE are defined at module level (no need to redefine here)
     qe_fixes = 0
