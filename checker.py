@@ -731,9 +731,10 @@ def _row_sim(output, ref):
     return max(_jaccard(no, nr), _trigram(no, nr))
 
 
-SIM_THRESHOLD = 0.88      # flag rows at or above this combined similarity
-# 0.88: CDReader rejects chapters with avg similarity >~80%. Catching rows at 88%+
-# while keys are still alive pulls the average into the 72-77% finish zone.
+SIM_THRESHOLD = 0.84      # flag rows at or above this combined similarity
+# 0.84: Italian CDReader has stricter similarity rejection than German (~80% threshold).
+# Catching rows at 84%+ during unified retry pulls the average into the safe zone.
+# (German pipeline uses 0.88; lowered for Italian after ErrMessage10 on first production run.)
 
 
 # Module-level synonym table — shared by _deterministic_change and _find_synonym_pair.
@@ -895,7 +896,7 @@ def _deterministic_change(text):
     return text
 
 
-def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None):
+def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None, call_timeout=20):
     """Account-group-aware Gemini call for single-row retries.
     
     Returns parsed JSON list or None.
@@ -904,6 +905,9 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None)
         deadline: optional float (time.time() epoch). If set, the function
                   short-circuits and returns None when wall-clock exceeds this
                   value, preventing unbounded blocking across group rotations.
+        call_timeout: HTTP request timeout in seconds (default 20s). Recovery
+                      prompts are longer and need more thinking time — pass 45
+                      to avoid premature timeouts on complex prompts.
     
     Key design (2026-03-17, timeout + deadline update):
       1. ACCOUNT-GROUP ROTATION: Keys are in 3 Google accounts with independent RPM/RPD.
@@ -940,10 +944,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None)
         via a different key/group on failure, so we do not retry the same key here.
         Returns (parsed_list_or_None, is_429_rpd, is_429_rpm).
 
-        Timeout: 20s — single-row prompts are small; if Google hasn't responded
-        in 20s it is almost certainly a transient hang, not slow processing.
-        Failing fast lets group rotation immediately try the next account group
-        rather than blocking for 45s+ per key.
+        Timeout: call_timeout (default 20s for retry, 45s for recovery prompts).
         """
         _key_last_used[api_key] = time.time()
         try:
@@ -953,7 +954,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None)
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
                 },
-                timeout=20,
+                timeout=call_timeout,
             )
         except requests.exceptions.RequestException as e:
             # Propagate — caller will log and try next group key
@@ -1439,8 +1440,8 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
 
 # ─── Remedy D: ErrMessage10 self-healing recovery ─────────────────────────────
 _MAX_RETRIES       = 35  # max rows retried per chapter (moved to module level, checker-27)
-_RECOVERY_MAX_ROWS = 10
-_RECOVERY_SIM_THRESHOLD = 0.86  # cast slightly wider net than SIM_THRESHOLD=0.88
+_RECOVERY_MAX_ROWS = 15
+_RECOVERY_SIM_THRESHOLD = 0.80  # wider net than SIM_THRESHOLD — Italian CDReader is stricter
 
 _RECOVERY_PROMPT = (
     "You are an Italian MT post-editor performing an urgent quality correction.\n\n"
@@ -1498,6 +1499,17 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
     log(f"  \U0001f501 Recovery: re-editing {len(targets)} row(s) "
         f"(worst sim: {targets[0][1]:.0%}, threshold: {_RECOVERY_SIM_THRESHOLD:.0%})...")
 
+    # ── Pre-recovery RPM cooldown ─────────────────────────────────────────────
+    # The unified retry loop just finished using keys. Without a cooldown, all
+    # keys are still in their RPM window and every recovery call will timeout
+    # waiting for a cooled key. Same pattern as _PRE_RETRY_COOLDOWN in the
+    # main pipeline — clear RPM state and wait for windows to expire.
+    _cooldown_s = 65
+    log(f"  \u23f3 Recovery: RPM cooldown — waiting {_cooldown_s}s for key windows to expire...")
+    _exhausted_keys.intersection_update(_rpd_exhausted_keys)  # clear RPM state, keep RPD
+    time.sleep(_cooldown_s)
+    log(f"  \u2705 Recovery: RPM cooldown complete — starting re-edit calls.")
+
     corrections = []
 
     for sort, sim, saved_content, mt_content in targets:
@@ -1512,7 +1524,7 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
             sort_num=sort,
         )
 
-        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=2048)
+        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=2048, call_timeout=45)
 
         if result and isinstance(result, list) and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
