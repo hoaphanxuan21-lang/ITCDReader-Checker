@@ -2121,7 +2121,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
 
         # Determine EN final punctuation (ignoring trailing quotes)
         _en_stripped_p = eng.rstrip().rstrip('"”“"»').rstrip()
-        _de_stripped_p = c.rstrip().rstrip('„“”""«»').rstrip()
+        _it_stripped_p = c.rstrip().rstrip('„“”""«»').rstrip()
 
         if not _en_stripped_p or not _it_stripped_p:
             continue
