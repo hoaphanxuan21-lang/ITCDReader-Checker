@@ -66,8 +66,8 @@ jobs:
           IT_TELEGRAM_BOT_TOKEN: ${{ secrets.IT_TELEGRAM_BOT_TOKEN }}
           IT_TELEGRAM_CHAT_ID:   ${{ secrets.IT_TELEGRAM_CHAT_ID }}
 
-          # ─── Gemini API keys (23 keys, ITGEMINI_ prefix) ──────────────
-          # Account A (keys 1-8): free tier
+          # ─── Gemini API keys (28 keys, ITGEMINI_ prefix) ──────────────
+          # Account A (keys 1-9): free tier
           ITGEMINI_API_KEY:    ${{ secrets.ITGEMINI_API_KEY }}
           ITGEMINI_API_KEY_2:  ${{ secrets.ITGEMINI_API_KEY_2 }}
           ITGEMINI_API_KEY_3:  ${{ secrets.ITGEMINI_API_KEY_3 }}
@@ -76,7 +76,10 @@ jobs:
           ITGEMINI_API_KEY_6:  ${{ secrets.ITGEMINI_API_KEY_6 }}
           ITGEMINI_API_KEY_7:  ${{ secrets.ITGEMINI_API_KEY_7 }}
           ITGEMINI_API_KEY_8:  ${{ secrets.ITGEMINI_API_KEY_8 }}
-          # Account B (keys 12-18): free tier
+          ITGEMINI_API_KEY_9:  ${{ secrets.ITGEMINI_API_KEY_9 }}
+          # Account B (keys 10-18): free tier
+          ITGEMINI_API_KEY_10: ${{ secrets.ITGEMINI_API_KEY_10 }}
+          ITGEMINI_API_KEY_11: ${{ secrets.ITGEMINI_API_KEY_11 }}
           ITGEMINI_API_KEY_12: ${{ secrets.ITGEMINI_API_KEY_12 }}
           ITGEMINI_API_KEY_13: ${{ secrets.ITGEMINI_API_KEY_13 }}
           ITGEMINI_API_KEY_14: ${{ secrets.ITGEMINI_API_KEY_14 }}
@@ -84,7 +87,10 @@ jobs:
           ITGEMINI_API_KEY_16: ${{ secrets.ITGEMINI_API_KEY_16 }}
           ITGEMINI_API_KEY_17: ${{ secrets.ITGEMINI_API_KEY_17 }}
           ITGEMINI_API_KEY_18: ${{ secrets.ITGEMINI_API_KEY_18 }}
-          # Account C (keys 22-28): key 28 is paid tier
+          # Account C (keys 19-28): key 28 is paid tier
+          ITGEMINI_API_KEY_19: ${{ secrets.ITGEMINI_API_KEY_19 }}
+          ITGEMINI_API_KEY_20: ${{ secrets.ITGEMINI_API_KEY_20 }}
+          ITGEMINI_API_KEY_21: ${{ secrets.ITGEMINI_API_KEY_21 }}
           ITGEMINI_API_KEY_22: ${{ secrets.ITGEMINI_API_KEY_22 }}
           ITGEMINI_API_KEY_23: ${{ secrets.ITGEMINI_API_KEY_23 }}
           ITGEMINI_API_KEY_24: ${{ secrets.ITGEMINI_API_KEY_24 }}
