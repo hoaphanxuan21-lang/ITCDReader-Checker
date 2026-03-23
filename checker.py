@@ -2561,19 +2561,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 c = row["content"]
                 comma_adds += 1
 
-        # Rule C2: Add missing comma before close-quote after ?/! inline (same row as attribution).
-        # Italian: \u201cCosa?,\u201d chiese. (comma after ? but before close-quote)
-        if re.search(r'[?!]"(?!,)', c):
-            c_c2 = re.sub(
-                r'([?!])(")([ \t]+(?:' + _SV + r'))',
-                r'\1,\2\3', c
-            )
-            if c_c2 != c:
-                row["content"] = c_c2
-                c = c_c2
-                comma_adds += 1
-
-
+        # Rule C2: REMOVED — Italian does not use comma after ?/! before close-quote.
+        # "Dove sei stata?" chiese. is correct; "Dove sei stata?," chiese. is wrong.
+        # (Rule was inherited from German pipeline where ?," IS correct.)
         # Rule D: Replace literal mid-sentence em-dashes with commas.
         if '\u2014' in c:
             c_nodash = re.sub(r'(?<=\w)\s*\u2014\s*(?=\w)', ', ', c)
@@ -2585,7 +2575,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # Rule E: Move comma from AFTER closing quote to BEFORE it (Italian convention).
         # Wrong: \u201cTesto\u201d, disse   (comma after close-quote — German style)
         # Right: \u201cTesto,\u201d disse   (comma before close-quote — Italian style)
-        if not re.search(r'[?!],"', c):
+        if not re.search(r'[?!],?"', c):  # skip when speech ends with ?/!
             c_e = re.sub(
                 r'(")\s*,\s*([ \t]*(?:' + _SV + r'))',
                 r',\1 \2', c
@@ -2595,26 +2585,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 comma_fixes += 1
                 c = row["content"]
 
-        # Rule F: Add missing comma before close-quote after ! when followed by attribution.
-        # Italian: \u201cFermati!,\u201d esclam\u00f2. (comma after ! but before close-quote)
-        # Inline: !\u201d followed by space+attribution without comma
-        if re.search(r'!"(?!,)', c):
-            c_f = re.sub(
-                r'(!)(")([ \t]+(?:' + _SV + r'))',
-                r'\1,\2\3', c
-            )
-            if c_f != c:
-                row["content"] = c_f
-                comma_adds += 1
-                c = row["content"]
-        # Cross-row: row ends with !\u201d and next row is attribution \u2192 insert comma
-        if c.rstrip().endswith('!"') and not c.rstrip().endswith('!,"'):
-            if _is_continuation_row(next_content):
-                _c_s = c.rstrip()
-                row["content"] = _c_s[:-1] + ',"'
-                c = row["content"]
-                comma_adds += 1
-
+        # Rule F: REMOVED — Italian does not use comma after ! before close-quote.
+        # "Fermati!" esclamò. is correct Italian; "Fermati!," esclamò. is wrong.
+        # (Rule was inherited from German pipeline where !," IS correct.)
         # Rule G: Enforce canonical Capitolo header format: "Capitolo N Title Case Title"
         # Gemini sometimes returns headers all-lowercase, with a spurious colon, or with
         # wrong casing. Match case-insensitively to catch "capitolo 60 ..." variants.
