@@ -637,7 +637,10 @@ _SV_CORE = (
     # Verbs of rebuke/correction
     r"rimprover\u00f2|ammon\u00ec|"
     # Physical/emotive speech verbs common in genre fiction
-    r"grugnì|strill\u00f2|rantol\u00f2|gem\u00e8|sbuff\u00f2|bofonchi\u00f2|ghign\u00f2"
+    r"grugnì|strill\u00f2|rantol\u00f2|gem\u00e8|sbuff\u00f2|bofonchi\u00f2|ghign\u00f2|"
+    # Verbs of proposing/suggesting — common in fiction, passato remoto 3rd-sing.
+    # Absent from previous list; caused fallback-to-end-of-text quote wrapping (Image 2).
+    r"propose|sugger\u00ec"
 )
 # _SV: Full verb list for INLINE same-row attribution matching.
 # Context (same-row dialogue) makes ambiguity much lower here.
@@ -1105,15 +1108,21 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
 
     return None
 
-def _unified_retry(all_rephrased, input_data, rows):
+def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
     """Identify and retry rows that are verbatim, too similar to MT, or truncated.
-    
+
+    bleed_sorts: dict of sort → reason ('bleed'|'bgs'|'truncated') from _force_retry_sorts.
+    Bleed-flagged rows use an EN-source-anchored prompt so Gemini is not fed the
+    (potentially boundary-corrupt) MT as its primary reference.
+
     Combines the former mandatory-change pass, similarity guard, and truncation guard
     into a single retry mechanism. Returns the updated list.
     """
     _input_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
+    _eng_by_sort_ur = {r.get("sort", i): r.get("original", "") for i, r in enumerate(input_data)}
     mt_by_sort = {r.get("sort", i): (r.get("machineChapterContent") or r.get("modifChapterContent") or "")
                   for i, r in enumerate(rows)}
+    _bleed_sorts = bleed_sorts or {}
 
     # ── Collect all rows needing retry ────────────────────────────────────────
     retry_candidates = {}  # sort -> (current_out, reference, reason)
@@ -1212,73 +1221,102 @@ def _unified_retry(all_rephrased, input_data, rows):
                 log(f"    ⚠️  sort={sort_n}: deterministic fallback could not change row")
             continue
 
-        if "truncated" in reason:
-            prompt = (
-                "Sei un editor italiano esperto. "
-                "La riga seguente è stata troncata ed è incompleta. "
-                "Riscrivi il testo italiano COMPLETO con 2-3 miglioramenti redazionali "
-                "— verbi più precisi, connettivi più naturali, apertura di frase variata. "
-                "Conserva tutti i contenuti e significati. NON abbreviare.\n"
-                "Rispondi SOLO con: "
-                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<testo completo e migliorato>\"}]\n"
-                + json.dumps([{"sort": sort_n, "content": ref_text}], ensure_ascii=False)
-            )
-            temp = 0.5
-        elif "similar" in reason:
-            # Pre-compute the required word swap so the model has a concrete, mandatory
-            # anchor. Without this, the model at low temperature sees a correct sentence
-            # and returns it unchanged despite the "make a small change" instruction.
-            _swap = _find_synonym_pair(current_out)
-            if _swap:
-                _swap_instruction = (
-                    f"OBBLIGO: Nella tua risposta sostituisci esattamente la parola "
-                    f"\u00bb{_swap[0]}\u00ab con \u00bb{_swap[1]}\u00ab. "
-                    f"Adatta articoli/preposizioni se necessario.\n"
+        # ── Bleed/BGS path: EN-source anchor ─────────────────────────────────
+        # For rows restored from MT due to bleed or BGS errors, the MT itself may
+        # carry the boundary error (CDReader source misalignment). Sending that MT
+        # back to Gemini as the primary reference perpetuates the bleed cycle.
+        # Fix: use the EN source as the primary reference instead of MT.
+        # The EN is generated independently from Chinese and will not share the
+        # CDReader MT boundary error.
+        _is_bleed_row = sort_n in _bleed_sorts and _bleed_sorts[sort_n] in ('bleed', 'bgs')
+        if _is_bleed_row:
+            _en_src = _eng_by_sort_ur.get(sort_n, "")
+            _mt_src = ref_text  # MT (may be boundary-corrupt — used as secondary context only)
+            if _en_src.strip():
+                prompt = (
+                    "Sei un editor italiano esperto. Questa riga è stata ripristinata dalla "
+                    "traduzione automatica perché l'output precedente conteneva contenuto da una "
+                    "riga adiacente (bleed di riga) o solo una clausola di attribuzione.\n\n"
+                    "FONTE INGLESE (riferimento principale):\n" + _en_src + "\n\n"
+                    "TRADUZIONE AUTOMATICA (italiano — riferimento secondario):\n" + _mt_src + "\n\n"
+                    "Produci una post-editing italiana corretta e completa SOLO per questa riga. "
+                    "NON includere contenuto da righe adiacenti. "
+                    "Apporta 2-3 miglioramenti redazionali: verbi più precisi, flusso migliore, "
+                    "adattamento idiomatico. Il risultato deve sembrare scritto da un madrelingua.\n"
+                    "Rispondi SOLO con: "
+                    "[{\"sort\": " + str(sort_n) + ", \"content\": \"<italiano migliorato>\"}]\n"
                 )
+                temp = 0.5
             else:
-                _swap_instruction = (
-                    "OBBLIGO: Apporta 2-3 miglioramenti concreti — "
-                    "NON restituire la stessa frase.\n"
-                )
-            prompt = (
-                "Sei un editor italiano esperto. La frase seguente è troppo simile al "
-                "testo di riferimento. Apporta 2-3 miglioramenti redazionali significativi: "
-                "precisione verbale, ristrutturazione della frase, connettivi più naturali, "
-                "adattamento idiomatico. Il risultato deve sembrare scritto da un madrelingua.\n"
-                + _swap_instruction +
-                "Rispondi SOLO con: "
-                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<migliorato>\"}]\n"
-                + json.dumps([{"sort": sort_n, "reference": ref_text, "content": current_out}],
-                             ensure_ascii=False)
-            )
-            temp = 0.5
-        else:  # verbatim
-            # Same approach: give the model a specific word to swap, not a vague instruction.
-            _swap = _find_synonym_pair(current_out)
-            if _swap:
-                _swap_instruction = (
-                    f"OBBLIGO: Nella tua risposta sostituisci esattamente la parola "
-                    f"\u00bb{_swap[0]}\u00ab con \u00bb{_swap[1]}\u00ab. "
-                    f"Adatta articoli/preposizioni se necessario.\n"
-                )
-            else:
-                _swap_instruction = (
-                    "OBBLIGO: Apporta 2-3 miglioramenti concreti — "
-                    "NON restituire la stessa frase.\n"
-                )
-            prompt = (
-                "Sei un editor italiano esperto. Questa frase è identica al testo di input "
-                "e deve essere migliorata. Apporta 2-3 modifiche redazionali significative: "
-                "precisione verbale, ristrutturazione della frase, connettivi più naturali. "
-                "Il risultato deve suonare autentico per un lettore madrelingua.\n"
-                + _swap_instruction +
-                "Rispondi SOLO con: [{\"sort\": " + str(sort_n) + ", \"content\": \"<migliorato>\"}]\n"
-                + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
-            )
-            temp = 0.5
+                # No EN source available — fall through to standard verbatim/similar path
+                _is_bleed_row = False
 
+        if not _is_bleed_row:
+            if "truncated" in reason:
+                prompt = (
+                    "Sei un editor italiano esperto. "
+                    "La riga seguente è stata troncata ed è incompleta. "
+                    "Riscrivi il testo italiano COMPLETO con 2-3 miglioramenti redazionali "
+                    "— verbi più precisi, connettivi più naturali, apertura di frase variata. "
+                    "Conserva tutti i contenuti e significati. NON abbreviare.\n"
+                    "Rispondi SOLO con: "
+                    "[{\"sort\": " + str(sort_n) + ", \"content\": \"<testo completo e migliorato>\"}]\n"
+                    + json.dumps([{"sort": sort_n, "content": ref_text}], ensure_ascii=False)
+                )
+                temp = 0.5
+            elif "similar" in reason:
+                _swap = _find_synonym_pair(current_out)
+                if _swap:
+                    _swap_instruction = (
+                        f"OBBLIGO: Nella tua risposta sostituisci esattamente la parola "
+                        f"\u00bb{_swap[0]}\u00ab con \u00bb{_swap[1]}\u00ab. "
+                        f"Adatta articoli/preposizioni se necessario.\n"
+                    )
+                else:
+                    _swap_instruction = (
+                        "OBBLIGO: Apporta 2-3 miglioramenti concreti — "
+                        "NON restituire la stessa frase.\n"
+                    )
+                prompt = (
+                    "Sei un editor italiano esperto. La frase seguente è troppo simile al "
+                    "testo di riferimento. Apporta 2-3 miglioramenti redazionali significativi: "
+                    "precisione verbale, ristrutturazione della frase, connettivi più naturali, "
+                    "adattamento idiomatico. Il risultato deve sembrare scritto da un madrelingua.\n"
+                    + _swap_instruction +
+                    "Rispondi SOLO con: "
+                    "[{\"sort\": " + str(sort_n) + ", \"content\": \"<migliorato>\"}]\n"
+                    + json.dumps([{"sort": sort_n, "reference": ref_text, "content": current_out}],
+                                 ensure_ascii=False)
+                )
+                temp = 0.5
+            else:  # verbatim
+                _swap = _find_synonym_pair(current_out)
+                if _swap:
+                    _swap_instruction = (
+                        f"OBBLIGO: Nella tua risposta sostituisci esattamente la parola "
+                        f"\u00bb{_swap[0]}\u00ab con \u00bb{_swap[1]}\u00ab. "
+                        f"Adatta articoli/preposizioni se necessario.\n"
+                    )
+                else:
+                    _swap_instruction = (
+                        "OBBLIGO: Apporta 2-3 miglioramenti concreti — "
+                        "NON restituire la stessa frase.\n"
+                    )
+                prompt = (
+                    "Sei un editor italiano esperto. Questa frase è identica al testo di input "
+                    "e deve essere migliorata. Apporta 2-3 modifiche redazionali significative: "
+                    "precisione verbale, ristrutturazione della frase, connettivi più naturali. "
+                    "Il risultato deve suonare autentico per un lettore madrelingua.\n"
+                    + _swap_instruction +
+                    "Rispondi SOLO con: [{\"sort\": " + str(sort_n) + ", \"content\": \"<migliorato>\"}]\n"
+                    + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
+                )
+                temp = 0.5
+        # end if not _is_bleed_row
+
+        _use_4096 = "truncated" in reason or _is_bleed_row
         result = _call_gemini_simple(prompt, temperature=temp,
-                                     max_tokens=4096 if "truncated" in reason else 2048)
+                                     max_tokens=4096 if _use_4096 else 2048)
         if result and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
             if new_content != current_out:
@@ -1621,6 +1659,31 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
     comma_fixes = 0
     comma_adds = 0
     dash_fixes = 0
+
+    # ── Pre-Pass 0: Whitespace normalisation ─────────────────────────────────
+    # Gemini occasionally emits tab characters (\t), carriage returns (\r), or
+    # non-breaking spaces (U+00A0) inside content values. _fix_json_strings escapes
+    # literal \n/\r/\t before JSON parse, but the parsed Python string still contains
+    # the actual whitespace characters. CDReader renders \t as a visible '·' separator
+    # (Image 3 — "D'accordo, · andrò · a · prenderlo…"). Fix: collapse all non-space
+    # whitespace and runs of multiple spaces to a single space, then strip.
+    # Applied before any guard so downstream checks receive clean content.
+    _ws_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        c = row.get("content", "")
+        if not c:
+            continue
+        # Collapse tabs, carriage returns, non-breaking spaces, and multi-space runs
+        c_ws = re.sub(r'[\t\r\u00a0]|[ ]{2,}', ' ', c).strip()
+        if c_ws != c:
+            row["content"] = c_ws
+            _ws_fixes += 1
+            log(f"  ⚠️  WS-norm: sort={sort_n} whitespace collapsed: {c!r} → {c_ws!r}")
+    if _ws_fixes:
+        log(f"  💬 WS-norm: normalised {_ws_fixes} row(s) with irregular whitespace")
 
     # ── Pre-Pass QE: BGS confusion guard ─────────────────────────────────────────
     # Gemini occasionally outputs a pure attribution clause (inciso attributivo) for a row
@@ -3367,23 +3430,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         log(f"  ✅ RPM cooldown complete — retry loop starting with fresh key pool.")
 
     # Unified retry: identify and re-request verbatim, similar, or truncated rows
-    all_rephrased = _unified_retry(sorted_rows, input_data, rows)
+    all_rephrased = _unified_retry(sorted_rows, input_data, rows,
+                                    bleed_sorts=_force_retry_sorts)
 
     # Re-run post-processing on retry output to ensure retried rows get
     # the same treatment (Pass QE, comma rules, glossary enforcement, etc.)
     sorted_final = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
     _post_process(sorted_final, input_data, glossary_terms, skip_bgs_guard=True,
                    force_retry_sorts=_force_retry_sorts)
-
-    # ── Remedy A: Force-retry pass for trunc-guard rows ──────────────────────────
-    if _force_retry_sorts:
-        sorted_final = _run_force_retry_pass(
-            force_retry_sorts=_force_retry_sorts,
-            sorted_final=sorted_final,
-            rows=rows,
-            input_data=input_data,
-            glossary_terms=glossary_terms,
-        )
 
     return sorted_final
 
