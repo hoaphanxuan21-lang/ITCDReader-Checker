@@ -53,22 +53,27 @@ CDREADER_AREA  = os.environ.get("CDREADER_AREA",       "IT")
 
 # Multi-key Gemini rotation: keys tried in order, exhausted keys skipped for the run
 _GEMINI_KEYS_RAW = [
-    os.environ.get("ITGEMINI_API_KEY",   ""),
-    os.environ.get("ITGEMINI_API_KEY_2", ""),
-    os.environ.get("ITGEMINI_API_KEY_3", ""),
-    os.environ.get("ITGEMINI_API_KEY_4", ""),
-    os.environ.get("ITGEMINI_API_KEY_5", ""),
-    os.environ.get("ITGEMINI_API_KEY_6", ""),
-    os.environ.get("ITGEMINI_API_KEY_7", ""),
-    os.environ.get("ITGEMINI_API_KEY_8", ""),
-                os.environ.get("ITGEMINI_API_KEY_12", ""),
+    os.environ.get("ITGEMINI_API_KEY",    ""),
+    os.environ.get("ITGEMINI_API_KEY_2",  ""),
+    os.environ.get("ITGEMINI_API_KEY_3",  ""),
+    os.environ.get("ITGEMINI_API_KEY_4",  ""),
+    os.environ.get("ITGEMINI_API_KEY_5",  ""),
+    os.environ.get("ITGEMINI_API_KEY_6",  ""),
+    os.environ.get("ITGEMINI_API_KEY_7",  ""),
+    os.environ.get("ITGEMINI_API_KEY_8",  ""),
+    os.environ.get("ITGEMINI_API_KEY_9",  ""),
+    os.environ.get("ITGEMINI_API_KEY_10", ""),
+    os.environ.get("ITGEMINI_API_KEY_11", ""),
+    os.environ.get("ITGEMINI_API_KEY_12", ""),
     os.environ.get("ITGEMINI_API_KEY_13", ""),
     os.environ.get("ITGEMINI_API_KEY_14", ""),
     os.environ.get("ITGEMINI_API_KEY_15", ""),
     os.environ.get("ITGEMINI_API_KEY_16", ""),
     os.environ.get("ITGEMINI_API_KEY_17", ""),
     os.environ.get("ITGEMINI_API_KEY_18", ""),
-            os.environ.get("ITGEMINI_API_KEY_21", ""),
+    os.environ.get("ITGEMINI_API_KEY_19", ""),
+    os.environ.get("ITGEMINI_API_KEY_20", ""),
+    os.environ.get("ITGEMINI_API_KEY_21", ""),
     os.environ.get("ITGEMINI_API_KEY_22", ""),
     os.environ.get("ITGEMINI_API_KEY_23", ""),
     os.environ.get("ITGEMINI_API_KEY_24", ""),
@@ -106,9 +111,9 @@ _PAID_KEY: str = os.environ.get("ITGEMINI_API_KEY_28", "").strip()
 
 # ─── Account-group-aware key management ───────────────────────────────────────
 # Keys are spread across 3 distinct Google accounts (= 3 independent RPM/RPD pools):
-# Account A: ITGEMINI_API_KEY through ITGEMINI_API_KEY_8   (positions 0-7,  8 keys)
-# Account B: ITGEMINI_API_KEY_12 through ITGEMINI_API_KEY_18 (positions 8-14, 7 keys)
-# Account C: ITGEMINI_API_KEY_21 through ITGEMINI_API_KEY_28 (positions 15-22, 8 keys, includes paid)
+# Account A: ITGEMINI_API_KEY through ITGEMINI_API_KEY_9  (positions 0-8,  9 keys)
+# Account B: ITGEMINI_API_KEY_10 through ITGEMINI_API_KEY_18 (positions 9-17, 9 keys)
+# Account C: ITGEMINI_API_KEY_19 through ITGEMINI_API_KEY_28 (positions 18-27, includes paid)
 # When ONE key in an account returns 429-RPM, ALL keys in that account are blocked
 # (rate limits are per Google Cloud project). But OTHER accounts are still available.
 _ACCOUNT_GROUPS: list = []  # list of list[str], populated by _init_account_groups()
@@ -118,7 +123,7 @@ def _init_account_groups():
     """Build account group lists from _GEMINI_KEYS_RAW. Called once at pipeline start.
     Separated from module level to avoid side effects at import time (testability)."""
     _ACCOUNT_GROUPS.clear()
-    for _ag_start, _ag_end in [(0, 8), (8, 15), (15, 23)]:
+    for _ag_start, _ag_end in [(0, 9), (9, 18), (18, 28)]:
         _ag_keys = [k for k in _GEMINI_KEYS_RAW[_ag_start:_ag_end] if k.strip()]
         _ACCOUNT_GROUPS.append(_ag_keys)
     _ag_counts = [len(g) for g in _ACCOUNT_GROUPS]
