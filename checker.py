@@ -1827,9 +1827,18 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 if m_early and len(text[:m_early.start()].split()) <= 3:
                     return m_early.start() + 1, False
         # ── Priority 2: SV verb with comma ──────────────────────────
+        # BOUNDARY GUARD: if a sentence-ending [?!] followed by an uppercase non-SV
+        # word appears BEFORE the SV match position, the speech ended at that boundary
+        # and the comma+SV belongs to narration, not attribution after the speech.
+        #   ✓ '"Tienila d\'occhio," disse.' → no boundary before disse → fire at comma
+        #   ✗ '"Stai spiando? Hank quasi, annuì.' → ? + Hank (non-SV) before annuì → defer to P4
         m = re.search(r',\s+(' + _SV + r')\b', text, re.IGNORECASE)
         if m:
-            return m.start(), False
+            _pre_sv = text[:m.start()]
+            _bound = re.search(r'[?!]\s+([A-Z][a-zA-Zàèéìòù]*)', _pre_sv)
+            if not (_bound and not re.match(r'^(?:' + _SV + r')$', _bound.group(1), re.IGNORECASE)):
+                return m.start(), False
+            # else: boundary+non-SV word precedes the verb → fall through to Priority 4
         # ── Priority 3: SV verb without comma ───────────────────────
         m2 = re.search(r'(?<=[a-zàèéìòù!?.…])\s+(' + _SV + r')\b', text, re.IGNORECASE)
         if m2:
@@ -1838,16 +1847,18 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # Catches attribution verbs NOT in _SV by matching the Italian
         # attribution structure:  , [lowercase-verb] [Name/pronoun]
         # After a closing quote, Italian places the verb before or after the subject — the verb
-        # is lowercase, followed by the subject (proper name =
-        # uppercase, or pronoun). This pattern ONLY occurs in attribution:
-        #   ✓ , assicurò Greta    (lowercase verb + capitalized name)
-        #   ✓ , consolò lei        (lowercase verb + pronoun)
+        # is lowercase, followed by the subject (proper name = uppercase, or pronoun).
+        # SUFFIX GUARD: the "verb" must end in a passato remoto suffix (ò, ì, è, ette, emme,
+        # este) to avoid false positives on honorifics and common nouns.
+        #   ✓ , assicurò Greta    (ends in ò — passato remoto)
+        #   ✓ , consolò lei        (ends in ò — passato remoto)
+        #   ✓ , rispose lui        (ends in e — 3rd-conj. passato remoto)
+        #   ✗ , signor Ward        (signor has no verb suffix → suppressed)
         #   ✗ , aprì la porta      (article "la" — not a name/pronoun)
-        #   ✗ , prese le chiavi    (article "le" — not a name/pronoun)
-        # This eliminates the whack-a-mole of adding individual verbs.
         _ATTRIB_PRONOUNS = r'(?:lui|lei|io|noi|voi|esso|essa)\b'
+        _PR_SUFFIX = r'[a-zàèéìòù]\w*(?:ò|ì|è|ette|emme|este|erse|ense)'
         m_struct = re.search(
-            r',\s+[a-zàèéìòù]\w{2,}\s+(?:' + _ATTRIB_PRONOUNS + r'|[A-Z][a-zàèéìòù])',
+            r',\s+' + _PR_SUFFIX + r'\s+(?:' + _ATTRIB_PRONOUNS + r'|[A-Z][a-zàèéìòù])',
             text
         )
         if m_struct:
@@ -1857,8 +1868,14 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         if m3:
             return m3.start() + 1, False
         # ── Priority 5: Short speech + comma + uppercase name ────────
+        # EN guard: only fire if EN source has attribution after its closing quote.
+        # If EN ends at its close quote (no attribution), a comma+uppercase word
+        # inside the Italian is a vocative or embedded name — not a speech boundary.
+        #   ✓ '"Sure," Mia replied.' → en_has_post_close → fire
+        #   ✗ '"Let me handle it, Hank."' → EN ends at " → suppress (Hank is vocative)
+        #   ✗ '"By the way, Joshua, has Iris...?"' → EN ends at " → suppress (Iris is mid-speech)
         m4 = re.search(r',\s+([A-Z][a-zàèéìòù])', text)
-        if m4 and len(text[:m4.start()].split()) <= 4:
+        if m4 and len(text[:m4.start()].split()) <= 4 and _en_has_post_close_attribution(eng):
             return m4.start(), False
         # ── Fallback: end of text ───────────────────────────────
         return len(text), False
@@ -1972,7 +1989,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         original = c  # compare against the RAW row, not the normalized form
 
         en_starts_quote = bool(eng and re.match(r'^[""„“«]', eng.strip()))
-        stripped = _strip_outer_quotes(fixed)
+        stripped = _strip_outer_quotes(fixed).strip()
 
         # Fix 3 (checker-27): Attribution-only quote-injection guard.
         # If Gemini returned a pure attribution clause (e.g. "disse lui e
