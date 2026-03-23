@@ -629,7 +629,9 @@ _SV_CORE = (
     r"rivel\u00f2|confess\u00f2|domand\u00f2|si rivolse|"
     r"volle|rassicur\u00f2|menzion\u00f2|indic\u00f2|parl\u00f2|"
     # Verbs of rebuke/correction
-    r"rimprover\u00f2|ammon\u00ec"
+    r"rimprover\u00f2|ammon\u00ec|"
+    # Physical/emotive speech verbs common in genre fiction
+    r"grugnì|strill\u00f2|rantol\u00f2|gem\u00e8|sbuff\u00f2|bofonchi\u00f2|ghign\u00f2"
 )
 # _SV: Full verb list for INLINE same-row attribution matching.
 # Context (same-row dialogue) makes ambiguity much lower here.
@@ -1967,7 +1969,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
 
         # Normalize French/angle quotes before stripping
         fixed = c.replace('«', '"').replace('»', '"')
-        original = fixed
+        original = c  # compare against the RAW row, not the normalized form
 
         en_starts_quote = bool(eng and re.match(r'^[""„“«]', eng.strip()))
         stripped = _strip_outer_quotes(fixed)
@@ -2035,13 +2037,16 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                     f"attribution verb but EN starts with speech. Skipping quote injection.")
                 fixed = stripped
             elif en_starts_quote:
-                # Start-of-row both: „ at start, “ guided by EN attribution
-                if _en_has_post_close_attribution(eng):
-                    pos, needs_comma = _find_speech_end(stripped, eng)
+                # Start-of-row both: " at start, " placed by _find_speech_end.
+                # Always call _find_speech_end regardless of _en_has_post_close_attribution
+                # so trailing narration bled into the row is not trapped inside quotes.
+                # Full-wrap only when pos == len(stripped) (pure speech, no boundary found).
+                pos, needs_comma = _find_speech_end(stripped, eng)
+                if pos < len(stripped):
                     inner = _italian_close_at(stripped, pos, needs_comma)
                     fixed = _QE_OPEN + inner
                 else:
-                    # No attribution after close → “ at start, ” at end
+                    # No boundary found — pure speech row, close at end
                     fixed = _QE_OPEN + stripped + _QE_CLOSE
             else:
                 # Mid-row both: narration + „speech“ + possible attribution
