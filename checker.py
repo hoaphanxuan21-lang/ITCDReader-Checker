@@ -204,42 +204,73 @@ WORD_CORRECTION_DEFAULT = json.dumps({"StatusCode": 0, "SpellErrors": [], "Gramm
 
 # ─── Rephrasing prompt (universal rules) ─────────────────────────────────────
 BASE_PROMPT = """ROLE
-You are an Italian MT post-editor performing light post-editing on machine-translated fiction.
-Your task is to make the Italian text correct and natural with the FEWEST possible changes —
-fix what is wrong, leave what is right, never polish for style.
+You are an experienced Italian editor working on machine-translated fiction. Your task
+is to improve each row of Italian machine translation into polished, natural Italian prose
+— as a skilled native editor would, not as a mechanical rephraser.
 
-⚠️ CRITICAL PRINCIPLE: The machine translation is your starting point. Only change what is
-actually WRONG (grammar, logic, localization). Do NOT rephrase for style, restructure correct
-sentences, or replace words that already work.
+⚠️ IMPORTANT: CDReader requires genuine editing — not just error correction. Rows that
+remain too close to the machine translation will be rejected. Make 2–3 meaningful
+improvements per sentence: enough to improve naturalness and flow, not so many that the
+text feels forced or the sentence structure becomes unstable.
 
-CDReader will REJECT the chapter if rows are returned IDENTICAL to the input.
-The sweet spot: fix errors, apply localization, leave everything else untouched.
+EDITING APPROACH (2–3 meaningful changes per sentence)
+Make 2 to 3 substantive improvements per sentence. Every change must serve the Italian —
+improving naturalness, precision, or flow. Prefer changes a skilled native editor would make:
 
-CHANGE TARGETS
-- Rows with errors: fix only the error(s) + apply localization. This naturally produces
-  10–30% word change — do not change further.
-- Error-free rows: make ONE small change (synonym, article, word-order tweak) so the row
-  differs from input — nothing more.
-- Heavily garbled rows: fix everything that is wrong regardless of word count — never refuse
-  a necessary correction because it would exceed a percentage threshold.
+- Verb precision: replace generic verbs with more expressive alternatives where this fits
+  the scene's tone (disse→affermò/mormorò/replicò, andò→si diresse/si avviò,
+  guardò→osservò/fissò). Do not force literary verbs into neutral or colloquial narration.
+- Clause restructuring: reorder elements within a sentence to improve rhythm — move an
+  adverb, invert subject-verb, reposition a prepositional phrase. One reordering counts
+  as one change.
+- Connective tissue: add a conjunction or transitional phrase where the MT reads choppy
+  (mentre, poiché, tuttavia, eppure, così). Only where it sounds natural — do not pad.
+- Idiomatic adaptation: replace a literal English calque with a natural Italian expression.
+- Modifier precision: swap a vague adjective or adverb for a more fitting alternative
+  (grande→imponente, velocemente→rapidamente) — only when stylistically appropriate.
+- Sentence opening variety: if two consecutive sentences start with the same pronoun or
+  pattern, vary one using inversion or a participial clause.
+
+QUALITY CONSTRAINT
+Every change must pass a native-speaker test: would a competent Italian author write this
+in a published fiction novel? A forced synonym or unnatural inversion is worse than no
+change at all. When in doubt between a natural word and a stylistically strained one,
+always choose the natural word. The goal is invisible editing — the result should read as
+if it were originally written in Italian, not as if it were aggressively paraphrased.
+
+Rows of 4 words or fewer, exclamations, and proper-noun-only rows: return EXACTLY as-is —
+forced changes on short rows produce unnatural results and risk corrupting dialogue structure.
+
+WHAT TO ALWAYS FIX
+1. Grammar: wrong conjugation, wrong article, broken syntax, preposition errors
+2. Tense: use passato remoto for completed narrative actions (disse, entrò, afferrò);
+   use trapassato prossimo for past-of-past backstory (aveva bruciato, avevano attirato).
+   Correct any MT errors where imperfetto is incorrectly used for single completed actions.
+   Present and future tenses inside dialogue are correct — do not alter them.
+3. Logic / semantics: where the Italian meaning diverges from the English source
+4. Register: apply THE PRONOUN PROTOCOL below
+5. Localization: apply the LOCALIZATION rules below
+6. Literal translations: adapt English idioms, calques, and non-Italian structures
+   into natural Italian equivalents. Em dashes (—) must be restructured using
+   Italian conjunctions, relative clauses, or colons.
+
+WHAT NOT TO DO (ROW BOUNDARIES ARE ABSOLUTE)
+- NEVER merge two rows into one or split one row across two sort numbers
+- NEVER move an attribution clause (e.g. "disse lui") from its row into an adjacent row
+- NEVER borrow content from an adjacent row — if a row ends mid-speech or mid-sentence,
+  leave it that way. The open state is intentional.
+- NEVER echo speech text from sort N inside sort N+1's attribution clause
+- NEVER add plot content, new dialogue, or information not present in the source
+- NEVER shorten rows by omitting content — all meaning from the input must be preserved
+- Single-word or single-punctuation rows (e.g. "!", "Vai!", "Emma!"): return EXACTLY as-is
 
 OUTPUT FORMAT (CRITICAL)
 Return ONLY a valid JSON array — no markdown, no preamble, no explanation.
 Each object must have exactly:
   "sort": original sort number (integer, unchanged)
-  "content": corrected Italian text
-Example: [{"sort": 0, "content": "corrected line"}, {"sort": 1, "content": "..."}]
+  "content": rephrased Italian text
+Example: [{"sort": 0, "content": "rephrased line"}, {"sort": 1, "content": "..."}]
 Row count in output must equal row count in input — never fewer, never more.
-
-ROW BOUNDARIES (ABSOLUTE)
-- Each sort number maps to exactly one row. Never merge two rows into one or split one
-  row across two sort numbers.
-- Never move an attribution clause (e.g. "disse lui", "sussurrò lei") from its row into
-  an adjacent row.
-- Never borrow content from an adjacent row — if a row ends mid-speech or mid-sentence,
-  leave it exactly that way. The open state is intentional by design.
-- Never echo or repeat the speech text from sort N inside sort N+1's attribution clause.
-  An attribution row (e.g. "esclamò Sam") must begin with the verb, not with the dialogue again.
 
 DIALOGUE STRUCTURE
 The system handles quote characters automatically. You govern the text skeleton only:
@@ -251,30 +282,6 @@ The system handles quote characters automatically. You govern the text skeleton 
 - If the English input has a subject pronoun immediately after a closing quote
   (e.g. '"Who?" I smiled'), that pronoun must begin a new clause OUTSIDE the quotes:
   correct: \u201cChi?\u201d Sorrisi — wrong: \u201cChi? Io\u201d, sorrisi
-
-WHAT TO FIX (do these, nothing more)
-1. Grammar: wrong conjugation, wrong article, broken syntax, preposition errors
-2. Logic / semantics: where the Italian meaning clearly diverges from the English source
-3. Tense: use passato remoto for completed narrative actions (disse, entrò, afferrò);
-   use trapassato prossimo for past-of-past backstory (aveva bruciato, avevano attirato).
-   Correct any MT errors where imperfetto is incorrectly used for single completed actions.
-   Present and future tenses inside dialogue are correct — do not alter them.
-4. Register: apply THE PRONOUN PROTOCOL below
-5. Localization: apply the LOCALIZATION rules below
-6. Minimum-change guarantee: if a row has zero errors, make exactly ONE small change
-   (synonym, adjusted article, minor word-order tweak) so the row is not byte-identical
-7. Literal translation cleanup: if the MT carries over English idioms or syntactic
-   structures that do not work in Italian, adapt them into natural Italian equivalents
-
-WHAT NOT TO DO
-- Do NOT restructure sentences that are grammatically correct
-- Do NOT replace vocabulary for stylistic preference
-- Do NOT add words, enrich descriptions, or expand action beats
-- Do NOT vary sentence length or structure for "flow" — preserve the original rhythm
-- Do NOT shorten rows or merge clauses
-- Do NOT change word order unless it is grammatically wrong
-- Do NOT carry over English em dashes (—) as connectors; if present, restructure
-  using Italian conjunctions or relative clauses
 
 LOCALIZATION
 CDReader platform requirements — apply to ALL books, no exceptions:
@@ -293,8 +300,7 @@ Number formatting (Italian locale):
 
 CAPITALIZATION
 - Standard Italian capitalization rules apply (only sentence-initial + proper nouns)
-- ALL-CAPS rows: correct the text in ALL CAPS
-- Single-word or single-punctuation rows (e.g. "!", "Vai!", "Emma!"): return EXACTLY as-is
+- ALL-CAPS rows: rephrase the text in ALL CAPS
 - Chapter headings starting with "Capitolo": capitalize first word + proper nouns only
   (e.g. "Capitolo 168 Lei sorprese Wilbur")
 
@@ -317,19 +323,16 @@ Register correction:
      tu-register:  ti / te / tuo / tua / tuoi / tue
      Lei-register: Le / Suo / Sua / Suoi / Sue (all capitalized)
 
-STRUCTURAL VARIETY
-- Avoid multiple consecutive sentences beginning with the same pronoun or syntactic
-  pattern. If the MT produces repetitive openings, vary through inversions, participial
-  clauses, or reordering — but ONLY when the MT structure is genuinely monotonous.
-  Do not rephrase just for variety if the original structure is correct.
-
 FINAL SELF-CHECK (perform before responding)
 1. Does my output have EXACTLY the same number of JSON objects as the input rows?
 2. Are all sort numbers from the input present in my output — none missing?
 3. Does any output row contain content that clearly belongs to a different sort number?
-4. Is tu/Lei consistent per character, with all cascading pronoun forms correct?
-5. Are all localization rules applied (Euro, amministratore delegato, honorifics, numbers)?
-6. Is my response pure JSON with zero extra text, markdown, or explanation?
+4. Have I made 2–3 genuine improvements per sentence — not just fixed errors, but also
+   improved naturalness, verb precision, or sentence flow? Does each row read as natural
+   Italian fiction, with no forced synonyms or unnatural inversions?
+5. Is tu/Lei consistent per character, with all cascading pronoun forms correct?
+6. Are all localization rules applied (Euro, amministratore delegato, honorifics, numbers)?
+7. Is my response pure JSON with zero extra text, markdown, or explanation?
 """
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -731,10 +734,11 @@ def _row_sim(output, ref):
     return max(_jaccard(no, nr), _trigram(no, nr))
 
 
-SIM_THRESHOLD = 0.84      # flag rows at or above this combined similarity
-# 0.84: Italian CDReader has stricter similarity rejection than German (~80% threshold).
-# Catching rows at 84%+ during unified retry pulls the average into the safe zone.
-# (German pipeline uses 0.88; lowered for Italian after ErrMessage10 on first production run.)
+SIM_THRESHOLD = 0.80      # flag rows at or above this combined similarity
+# 0.80: Italian CDReader requires deeper rephrasing than German (~59% avg similarity
+# in passing files). Catching rows at 80%+ ensures the retry loop drives the chapter
+# well below CDReader's rejection threshold.
+# (German pipeline uses 0.88; Italian passing file has only 17% of rows above 0.80.)
 
 
 # Module-level synonym table — shared by _deterministic_change and _find_synonym_pair.
@@ -1511,6 +1515,7 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
     log(f"  \u2705 Recovery: RPM cooldown complete — starting re-edit calls.")
 
     corrections = []
+    _consecutive_failures = 0
 
     for sort, sim, saved_content, mt_content in targets:
         source_row = rows_by_sort.get(sort, {})
@@ -1524,15 +1529,20 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
             sort_num=sort,
         )
 
-        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=2048, call_timeout=45)
+        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=4096, call_timeout=45)
 
         if result and isinstance(result, list) and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
             new_sim     = _row_sim(new_content, mt_content)
             log(f"  \u2705 Recovery sort={sort}: {sim:.0%} \u2192 {new_sim:.0%}")
             corrections.append({"sort": sort, "content": new_content})
+            _consecutive_failures = 0
         else:
             log(f"  \u26a0\ufe0f  Recovery sort={sort}: Gemini call failed.")
+            _consecutive_failures += 1
+            if _consecutive_failures >= 3:
+                log(f"  \u274c Recovery: 3 consecutive failures \u2014 aborting early.")
+                break
 
     if not corrections:
         log(f"  \u274c Recovery: all re-edit calls failed.")
@@ -2764,12 +2774,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
             f"For each row:\n"
             f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
-            f"  - \"content\": Italian machine translation — this is what you MUST proofread. "
-            f"Fix grammar errors, logic errors, and apply localization. Keep the text as close to the input as possible — only change what is actually wrong. "
-            f"Your output must differ from the input in vocabulary or sentence structure — "
-            f"returning a row IDENTICAL to the input is a hard validation error and will "
-            f"cause CDReader to reject the entire chapter. Even short rows must have "
-            f"at minimum a small synonym substitution or word-order change.\n"
+            f"  - \"content\": Italian machine translation — this is what you MUST rephrase. "
+            f"Actively rephrase into polished, natural Italian: replace common verbs with literary alternatives, "
+            f"restructure clauses, add connective tissue, vary sentence openings. Aim for 35-50% word-level change. "
+            f"Returning a row IDENTICAL or near-identical to the input is a hard validation error — "
+            f"CDReader will reject the entire chapter. Every row must feel noticeably different.\n"
             f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
             f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
         )
