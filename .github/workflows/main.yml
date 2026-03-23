@@ -1,0 +1,108 @@
+name: CDReader Italian Pipeline
+
+on:
+  schedule:
+    # Runs every 30 minutes. Adjust as needed.
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Run in test mode (no CDReader login/submit)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      override_chapter_id:
+        description: 'Override: process specific chapter ID (skip Task Center)'
+        required: false
+        default: ''
+      override_book_id:
+        description: 'Override: book ID for the overridden chapter'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run (claim but do not submit/finish)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+concurrency:
+  group: cdreader-italian
+  cancel-in-progress: false
+
+jobs:
+  process-chapter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Italian pipeline
+        env:
+          # ─── CDReader credentials ──────────────────────────────────────
+          CDREADER_EMAIL:    ${{ secrets.CDREADER_EMAIL }}
+          CDREADER_PASSWORD: ${{ secrets.CDREADER_PASSWORD }}
+
+          # ─── CDReader language config ──────────────────────────────────
+          CDREADER_TO_LANGUAGE: '413'  # Italian (confirmed)
+          CDREADER_AREA:       'IT'
+
+          # ─── Telegram (Italian bot) ────────────────────────────────────
+          IT_TELEGRAM_BOT_TOKEN: ${{ secrets.IT_TELEGRAM_BOT_TOKEN }}
+          IT_TELEGRAM_CHAT_ID:   ${{ secrets.IT_TELEGRAM_CHAT_ID }}
+
+          # ─── Gemini API keys (28 keys, ITGEMINI_ prefix) ──────────────
+          # Account A (keys 1-9): free tier
+          ITGEMINI_API_KEY:    ${{ secrets.ITGEMINI_API_KEY }}
+          ITGEMINI_API_KEY_2:  ${{ secrets.ITGEMINI_API_KEY_2 }}
+          ITGEMINI_API_KEY_3:  ${{ secrets.ITGEMINI_API_KEY_3 }}
+          ITGEMINI_API_KEY_4:  ${{ secrets.ITGEMINI_API_KEY_4 }}
+          ITGEMINI_API_KEY_5:  ${{ secrets.ITGEMINI_API_KEY_5 }}
+          ITGEMINI_API_KEY_6:  ${{ secrets.ITGEMINI_API_KEY_6 }}
+          ITGEMINI_API_KEY_7:  ${{ secrets.ITGEMINI_API_KEY_7 }}
+          ITGEMINI_API_KEY_8:  ${{ secrets.ITGEMINI_API_KEY_8 }}
+          ITGEMINI_API_KEY_9:  ${{ secrets.ITGEMINI_API_KEY_9 }}
+          # Account B (keys 10-18): free tier
+          ITGEMINI_API_KEY_10: ${{ secrets.ITGEMINI_API_KEY_10 }}
+          ITGEMINI_API_KEY_11: ${{ secrets.ITGEMINI_API_KEY_11 }}
+          ITGEMINI_API_KEY_12: ${{ secrets.ITGEMINI_API_KEY_12 }}
+          ITGEMINI_API_KEY_13: ${{ secrets.ITGEMINI_API_KEY_13 }}
+          ITGEMINI_API_KEY_14: ${{ secrets.ITGEMINI_API_KEY_14 }}
+          ITGEMINI_API_KEY_15: ${{ secrets.ITGEMINI_API_KEY_15 }}
+          ITGEMINI_API_KEY_16: ${{ secrets.ITGEMINI_API_KEY_16 }}
+          ITGEMINI_API_KEY_17: ${{ secrets.ITGEMINI_API_KEY_17 }}
+          ITGEMINI_API_KEY_18: ${{ secrets.ITGEMINI_API_KEY_18 }}
+          # Account C (keys 19-28): key 28 is paid tier
+          ITGEMINI_API_KEY_19: ${{ secrets.ITGEMINI_API_KEY_19 }}
+          ITGEMINI_API_KEY_20: ${{ secrets.ITGEMINI_API_KEY_20 }}
+          ITGEMINI_API_KEY_21: ${{ secrets.ITGEMINI_API_KEY_21 }}
+          ITGEMINI_API_KEY_22: ${{ secrets.ITGEMINI_API_KEY_22 }}
+          ITGEMINI_API_KEY_23: ${{ secrets.ITGEMINI_API_KEY_23 }}
+          ITGEMINI_API_KEY_24: ${{ secrets.ITGEMINI_API_KEY_24 }}
+          ITGEMINI_API_KEY_25: ${{ secrets.ITGEMINI_API_KEY_25 }}
+          ITGEMINI_API_KEY_26: ${{ secrets.ITGEMINI_API_KEY_26 }}
+          ITGEMINI_API_KEY_27: ${{ secrets.ITGEMINI_API_KEY_27 }}
+          ITGEMINI_API_KEY_28: ${{ secrets.ITGEMINI_API_KEY_28 }}
+
+          # ─── Mode switches ─────────────────────────────────────────────
+          TEST_MODE:            ${{ github.event.inputs.test_mode || 'false' }}
+          OVERRIDE_CHAPTER_ID:  ${{ github.event.inputs.override_chapter_id || '' }}
+          OVERRIDE_BOOK_ID:     ${{ github.event.inputs.override_book_id || '' }}
+          DRY_RUN:              ${{ github.event.inputs.dry_run || 'false' }}
+
+        run: python checker.py
