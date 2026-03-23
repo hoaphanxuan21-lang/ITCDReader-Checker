@@ -2820,6 +2820,82 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # then _fix_json_strings handles remaining literal control chars.
         return json.loads(_fix_json_strings(_repair_content_quotes(text)))
 
+    def _build_prompt(batch_data, batch_num, total_batches, next_batch_first=None, register_block=''):
+        """Build the prompt string and clean batch data, shared by both providers."""
+        lookahead_note = ""
+        if next_batch_first is not None:
+            lookahead_note = (
+                "\n\nLOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):\n"
+                f"The row immediately following this batch starts with: {json.dumps(next_batch_first.get('content', ''), ensure_ascii=False)}"
+            )
+        clean_batch = [
+            {
+                "sort": r["sort"],
+                "original": r.get("original", ""),
+                "content": r["content"],
+            }
+            for r in batch_data
+        ]
+        quote_hints = []
+        for r in batch_data:
+            role = r.get("_quote_role", "both")
+            sort_n = r['sort']
+            if role == "open":
+                quote_hints.append(f'  sort {sort_n}: OPENS a multi-row dialogue — use " to open, NO closing " at end')
+            elif role == "close":
+                quote_hints.append(f'  sort {sort_n}: CLOSES a multi-row dialogue — NO opening ", but add closing " at end')
+            elif role == "middle":
+                quote_hints.append(f"  sort {sort_n}: MIDDLE of a multi-row dialogue — NO opening or closing quotes")
+        quote_hint_block = ""
+        if quote_hints:
+            quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
+
+        # Filter glossary to only terms present in this batch's text — reduces prompt
+        # size dramatically and keeps
+        # the model focused on only the relevant terms rather than all 200+ entries.
+        batch_text = " ".join(
+            (r.get("original", "") + " " + r.get("content", "")).lower()
+            for r in batch_data
+        )
+        if glossary_terms:
+            # Build a set of all English words present in the batch (lowercased)
+            # for efficient multi-word substring matching.
+            # batch_text is already lowercase from the join above.
+            def _term_in_batch(term):
+                key = (term.get("dictionaryKey") or "").strip().lower()
+                sur = (term.get("enSurname") or "").strip().lower()
+                return (key and key in batch_text) or (sur and sur in batch_text)
+
+            merged = [t for t in glossary_terms if _term_in_batch(t)]
+            # Fallback: if filter produces nothing (e.g. batch is all Italian already),
+            # send the full list so the model still has context.
+            if not merged:
+                merged = glossary_terms
+            batch_glossary_text = format_glossary_for_prompt(merged)
+        else:
+            merged = []
+            batch_glossary_text = glossary_text_full
+        log(f"  Glossary for batch {batch_num}: {len(merged)} relevant terms (of {len(glossary_terms or [])} total)")
+
+        prompt = (
+            f"{BASE_PROMPT}\n\n"
+            f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
+            f"{batch_glossary_text}\n\n"
+            f"{register_block}"
+            f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
+            f"For each row:\n"
+            f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
+            f"  - \"content\": Italian machine translation — this is what you MUST rephrase. "
+            f"Actively rephrase into polished, natural Italian: replace common verbs with literary alternatives, "
+            f"restructure clauses, add connective tissue, vary sentence openings. Aim for 35-50% word-level change. "
+            f"Returning a row IDENTICAL or near-identical to the input is a hard validation error — "
+            f"CDReader will reject the entire chapter. Every row must feel noticeably different.\n"
+            f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
+            f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
+        )
+        return prompt, clean_batch
+
+
 
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None, register_block=''):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first, register_block=register_block)
