@@ -278,10 +278,10 @@ The system handles quote characters automatically. You govern the text skeleton 
 - Attribution following speech: the attribution clause follows the speech text with a comma
   (... , disse lui.)
 - Inner quotes inside already-open speech: use single quotes (' to open and ' to close) or
-  \u2018 and \u2019 — NEVER \u201c inside \u201c
+  \u2018 and \u2019 — NEVER " inside "
 - If the English input has a subject pronoun immediately after a closing quote
   (e.g. '"Who?" I smiled'), that pronoun must begin a new clause OUTSIDE the quotes:
-  correct: \u201cChi?\u201d Sorrisi — wrong: \u201cChi? Io\u201d, sorrisi
+  correct: "Chi?" Sorrisi — wrong: "Chi? Io", sorrisi
 
 LOCALIZATION
 CDReader platform requirements — apply to ALL books, no exceptions:
@@ -708,8 +708,8 @@ def _is_continuation_row(text):
         return False
     return True
 
-_QE_OPEN   = '“'  # “ U+201C (Italian open quote)
-_QE_CLOSE  = '”'  # ” U+201D (Italian close quote)
+_QE_OPEN   = '"'  # " U+0022 (straight double quote)
+_QE_CLOSE  = '"'  # " U+0022 (straight double quote)
 _QE_ANY_CLOSE_RE  = re.compile(r'[“”"]')
 _QE_CLOSE_AT_END  = re.compile(r'[“”"]\s*[,!?.]?\s*$')
 _QE_STARTS_OPEN   = re.compile(r'^[“”"]')
@@ -841,10 +841,10 @@ def _find_synonym_pair(text):
     _quote_ranges = []
     _i = 0
     while _i < len(text):
-        if text[_i] == '“':  # “ opening
-            _j = text.find('”', _i + 1)  # " closing
+        if text[_i] == '"':  # " straight quote (open)
+            _j = text.find('"', _i + 1)  # matching closing "
             if _j == -1:
-                _j = text.find('"', _i + 1)   # fallback: ASCII closing
+                _j = len(text) - 1  # fallback: end of text
             if _j != -1:
                 _quote_ranges.append((_i, _j))
                 _i = _j + 1
@@ -876,10 +876,10 @@ def _deterministic_change(text):
     _quote_ranges = []
     _i = 0
     while _i < len(text):
-        if text[_i] == '\u201c':  # “ opening
-            _j = text.find('\u201d', _i + 1)  # " closing
+        if text[_i] == '"':  # " straight quote (open)
+            _j = text.find('"', _i + 1)  # matching closing "
             if _j == -1:
-                _j = text.find('"', _i + 1)  # fallback: ASCII closing
+                _j = len(text) - 1  # fallback: end of text
             if _j != -1:
                 _quote_ranges.append((_i, _j))
                 _i = _j + 1
@@ -1966,7 +1966,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 role = "both"
 
         # Normalize French/angle quotes before stripping
-        fixed = c.replace('«', '“').replace('»', '”')
+        fixed = c.replace('«', '"').replace('»', '"')
         original = fixed
 
         en_starts_quote = bool(eng and re.match(r'^[""„“«]', eng.strip()))
@@ -2276,10 +2276,10 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # Rule C: Add missing comma inside close-quote when followed by attribution.
         # Italian: \u201cTesto,\u201d disse. (comma BEFORE close-quote)
         # Cross-row: row ends with \u201d (no comma before it) and next IS attribution.
-        elif c and c.rstrip().endswith('\u201d') and not c.rstrip().endswith(',\u201d'):
+        elif c and c.rstrip().endswith('"') and not c.rstrip().endswith(',"'):
             if _is_continuation_row(next_content):
                 _c_s = c.rstrip()
-                row["content"] = _c_s[:-1] + ',\u201d'
+                row["content"] = _c_s[:-1] + ',"'
                 c = row["content"]
                 comma_adds += 1
         elif c and c[-1] in ('"', '"') and not c.rstrip()[-2:-1] == ',':
@@ -2291,9 +2291,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
 
         # Rule C2: Add missing comma before close-quote after ?/! inline (same row as attribution).
         # Italian: \u201cCosa?,\u201d chiese. (comma after ? but before close-quote)
-        if re.search(r'[?!]\u201d(?!,)', c):
+        if re.search(r'[?!]"(?!,)', c):
             c_c2 = re.sub(
-                r'([?!])(\u201d)([ \t]+(?:' + _SV + r'))',
+                r'([?!])(")([ \t]+(?:' + _SV + r'))',
                 r'\1,\2\3', c
             )
             if c_c2 != c:
@@ -2313,9 +2313,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # Rule E: Move comma from AFTER closing quote to BEFORE it (Italian convention).
         # Wrong: \u201cTesto\u201d, disse   (comma after close-quote — German style)
         # Right: \u201cTesto,\u201d disse   (comma before close-quote — Italian style)
-        if not re.search(r'[?!],\u201d', c):
+        if not re.search(r'[?!],"', c):
             c_e = re.sub(
-                r'(\u201d)\s*,\s*([ \t]*(?:' + _SV + r'))',
+                r'(")\s*,\s*([ \t]*(?:' + _SV + r'))',
                 r',\1 \2', c
             )
             if c_e != c:
@@ -2326,9 +2326,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # Rule F: Add missing comma before close-quote after ! when followed by attribution.
         # Italian: \u201cFermati!,\u201d esclam\u00f2. (comma after ! but before close-quote)
         # Inline: !\u201d followed by space+attribution without comma
-        if re.search(r'!\u201d(?!,)', c):
+        if re.search(r'!"(?!,)', c):
             c_f = re.sub(
-                r'(!)(\u201d)([ \t]+(?:' + _SV + r'))',
+                r'(!)(")([ \t]+(?:' + _SV + r'))',
                 r'\1,\2\3', c
             )
             if c_f != c:
@@ -2336,10 +2336,10 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 comma_adds += 1
                 c = row["content"]
         # Cross-row: row ends with !\u201d and next row is attribution \u2192 insert comma
-        if c.rstrip().endswith('!\u201d') and not c.rstrip().endswith('!,\u201d'):
+        if c.rstrip().endswith('!"') and not c.rstrip().endswith('!,"'):
             if _is_continuation_row(next_content):
                 _c_s = c.rstrip()
-                row["content"] = _c_s[:-1] + ',\u201d'
+                row["content"] = _c_s[:-1] + ',"'
                 c = row["content"]
                 comma_adds += 1
 
@@ -2644,7 +2644,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     # Check if EN has colon + content (speech introduction)
                     has_colon_speech = bool(re.search(r':\s+[a-zA-Z]', en_j))
                     # Check if Italian MT has “ (MT detected speech start)
-                    mt_has_open = '\u201c' in mt_j
+                    mt_has_open = '"' in mt_j
                     if has_colon_speech or mt_has_open:
                         _found_opener = j
                         break
@@ -2730,9 +2730,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             role = r.get("_quote_role", "both")
             sort_n = r['sort']
             if role == "open":
-                quote_hints.append(f"  sort {sort_n}: OPENS a multi-row dialogue — use “ to open, NO closing ” at end")
+                quote_hints.append(f'  sort {sort_n}: OPENS a multi-row dialogue — use " to open, NO closing " at end')
             elif role == "close":
-                quote_hints.append(f"  sort {sort_n}: CLOSES a multi-row dialogue — NO opening “, but add closing ” at end")
+                quote_hints.append(f'  sort {sort_n}: CLOSES a multi-row dialogue — NO opening ", but add closing " at end')
             elif role == "middle":
                 quote_hints.append(f"  sort {sort_n}: MIDDLE of a multi-row dialogue — NO opening or closing quotes")
         quote_hint_block = ""
@@ -3017,15 +3017,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             _cN1 = (_rN1.get("content") or "").lstrip()
             if not _cN or not _cN1:
                 continue
-            # Look for: ends with closing quote, then whitespace, then new open „..." fragment
+            # Look for: ends with closing quote, then whitespace, then new open "..." fragment
             _echo_match = re.search(
-                r'[“"]\s+„(.{3,60}?)[“"]\s*$', _cN
+                r'"\s+"(.{3,60}?)"\s*$', _cN
             )
             if not _echo_match:
                 continue
             _echo_phrase = _echo_match.group(1).strip()
             # Check if Row N+1 starts with the same phrase (after its opening „)
-            _n1_inner = re.match(r'^„(.{3,60}?)[“",\s]', _cN1)
+            _n1_inner = re.match(r'^"(.{3,60}?)["",\s]', _cN1)
             if not _n1_inner:
                 continue
             _n1_phrase = _n1_inner.group(1).strip()
@@ -3035,7 +3035,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 # Strip the appended echo fragment from Row N
                 _stripped = _cN[:_echo_match.start()].rstrip()
                 # Ensure the stripped content still ends with a proper close quote
-                if not _stripped.endswith(('“', '"', '!', '?', '.')):
+                if not _stripped.endswith(('"', '!', '?', '.')):
                     continue  # Safety: don't strip if result would be malformed
                 _rN["content"] = _stripped
                 _echo_count += 1
@@ -3212,14 +3212,14 @@ def verify_output(original_rows, rephrased_rows):
             f"CDReader will likely reject (threshold ~25%). Similarity guard should have caught these."
         )
 
-    # Check 5: sample check for English quotation marks (should be Italian “/”)
-    # Only flag ASCII double quotes (clear signal) and paired English single quotes
-    # ('text'). Bare apostrophes (l'ha) and inner closing quotes (')
-    # are legitimate in Italian text and must not trigger this warning.
+    # Check 5: sample check for curly/smart quotation marks (pipeline should use straight ")
+    # Flag rows that contain U+201C/U+201D curly quotes — these indicate the quote
+    # reinject did not run or a stale output was carried through.
+    # ASCII double quotes are correct for this pipeline and must NOT be flagged.
     _eng_single_quote_pair = re.compile(r"'[^']{2,}'")  # 'text' pattern (English-style)
     english_quotes = [
         r.get("sort") for r in rephrased_rows
-        if '"' in r.get("content", "") or _eng_single_quote_pair.search(r.get("content", ""))
+        if '“' in r.get("content", "") or '”' in r.get("content", "") or _eng_single_quote_pair.search(r.get("content", ""))
     ]
     if len(english_quotes) > 5:
         issues.append(
@@ -3745,10 +3745,10 @@ def _run_inner(token):
             ch = c[i]
             if ch == '"':
                 if not in_quote:
-                    fixed += "“"  # “ opening
+                    fixed += '"'  # " opening (straight quote)
                     in_quote = True
                 else:
-                    fixed += "“"  # " closing
+                    fixed += '"'  # " closing (straight quote)
                     in_quote = False
             else:
                 fixed += ch
@@ -4031,11 +4031,11 @@ def run_test():
     TEST_ROWS = [
         {"sort": 0,  "machineChapterContent": "Capitolo 249 Come Poteva Non Volerla?",                "chapterConetnt": "Chapter 249 How Could He Not Want Her?"},
         {"sort": 1,  "machineChapterContent": "La famiglia Moss era conosciuta in citt\u00e0 da generazioni.",  "chapterConetnt": "The Moss family had been known in the city for generations."},
-        {"sort": 2,  "machineChapterContent": '\u201cNon me ne andr\u00f2\u201d disse lei con fermezza.',        "chapterConetnt": '"I will not go," she said firmly.'},
+        {"sort": 2,  "machineChapterContent": '"Non me ne andr\u00f2" disse lei con fermezza.',        "chapterConetnt": '"I will not go," she said firmly.'},
         {"sort": 3,  "machineChapterContent": "Lui non le rispose.",                                    "chapterConetnt": "He did not answer her."},
-        {"sort": 4,  "machineChapterContent": '\u201cAllora resta\u201d sussurr\u00f2 lui piano.',                "chapterConetnt": '"Then stay," he whispered softly.'},
+        {"sort": 4,  "machineChapterContent": '"Allora resta" sussurr\u00f2 lui piano.',                "chapterConetnt": '"Then stay," he whispered softly.'},
         {"sort": 5,  "machineChapterContent": "Lei lo guard\u00f2 a lungo prima di parlare.",              "chapterConetnt": "She looked at him for a long time before she spoke."},
-        {"sort": 6,  "machineChapterContent": '\u201cCosa hai detto?\u201d chiese lei incredula.',               "chapterConetnt": '"What did you say?" she asked in disbelief.'},
+        {"sort": 6,  "machineChapterContent": '"Cosa hai detto?" chiese lei incredula.',               "chapterConetnt": '"What did you say?" she asked in disbelief.'},
         {"sort": 7,  "machineChapterContent": "disse lui con voce calma.",                              "chapterConetnt": "he said in a calm voice."},
         {"sort": 8,  "machineChapterContent": "La famiglia Williams le era sempre stata accanto.",      "chapterConetnt": "The Williams family had always stood by her."},
         {"sort": 9,  "machineChapterContent": "Lui fece un passo indietro e incroci\u00f2 le braccia.",   "chapterConetnt": "He took a step back and crossed his arms."},
