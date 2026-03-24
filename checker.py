@@ -2217,6 +2217,87 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         log(f"  \U0001f4ac SV+colon bleed guard: restored {_svcolon_fixes} pair(s), "
             f"queued for EN-source retry.")
 
+    # ── Silent embed guard ──────────────────────────────────────────────────────
+    # Detects: N+1 narration silently embedded inside N's close-quoted speech.
+    # Root cause (sort=4/5): Gemini sees adjacent rows as a continuous passage and
+    # appends the START of row N+1 to the END of row N's speech, still inside the
+    # close-quote. The bleed is "compensated" — N's own speech is shortened to offset
+    # the appended fragment, so neither row shows a word-count anomaly. All existing
+    # word-count guards are completely blind to this pattern.
+    #
+    # The inescapable structural trace:
+    #   Inside a close-quoted span, [?!]\s*[Uppercase word] appears where the
+    #   uppercase word is the FIRST word of row N+1 — confirming the bleed.
+    #   Cross-row confirmation (fragment[:15] == N+1[:15]) is the false-positive
+    #   firewall: legitimate multi-sentence speech never matches the next row start.
+    #
+    # Action: surgically strip only the appended fragment from row N (preserving
+    # Gemini's high-quality rephrasing of the speech itself). Row N+1 is left
+    # untouched — it is correct. Row N is tagged for EN-source anchor retry.
+    _SILENT_EMBED_RE = re.compile(
+        r'[?!]\s*'
+        r'([A-Z\u00c0\u00c8\u00c9\u00cc\u00d2\u00d9]\w{2,})'
+    )
+    _silent_embed_fixes = 0
+
+    for _bi in range(len(_sorted_keys_pp) - 1):
+        _sn  = _sorted_keys_pp[_bi]
+        _sn1 = _sorted_keys_pp[_bi + 1]
+        if _sn == 0:
+            continue
+        _row_n  = _rows_by_sort_pp[_sn]
+        _row_n1 = _rows_by_sort_pp.get(_sn1)
+        _out_n  = _row_n.get('content', '').strip()
+        _out_n1 = (_row_n1.get('content', '') if _row_n1 else '').strip()
+
+        if not _out_n.endswith('"') or not _out_n1:
+            continue
+
+        # Work on content inside the outer quotes
+        _has_open = _out_n.startswith('"')
+        _c_start  = 1 if _has_open else 0
+        _content  = _out_n[_c_start:-1]
+
+        _matches = list(_SILENT_EMBED_RE.finditer(_content))
+        if not _matches:
+            continue
+
+        _detected = False
+        for _m in reversed(_matches):
+            # Fragment = everything from the uppercase word to end of content
+            _frag_start = _m.start(1)  # position of uppercase word in content
+            _fragment   = _content[_frag_start:].strip()
+
+            if len(_fragment) < 4:
+                continue
+
+            # Cross-row confirmation: fragment must match start of N+1
+            _check_len = min(len(_fragment), 15)
+            if _fragment[:_check_len].lower() != _out_n1[:_check_len].lower():
+                continue
+
+            # CONFIRMED: strip the fragment, keep speech up to and including [?!]
+            _punct_pos    = _m.start()          # position of [?!] in content
+            _clean_content = _content[:_punct_pos + 1]
+            _stripped     = ('"' if _has_open else '') + _clean_content + '"'
+
+            _row_n['content'] = _stripped
+            _silent_embed_fixes += 1
+            _detected = True
+            log(f"  \u26a0\ufe0f  Silent embed: sort={_sn} — appended fragment "
+                f"{_fragment[:30]!r} (= start of sort={_sn1}) stripped from N's speech. "
+                f"Stripped: {_stripped[:60]!r}")
+
+            # Tag N for EN-source anchor retry — the stripped speech may be shorter
+            # than ideal and Gemini can complete it correctly with the EN as anchor
+            if force_retry_sorts is not None:
+                force_retry_sorts[_sn] = 'bleed'
+            break  # only strip one fragment per row (outermost match is correct)
+
+    if _silent_embed_fixes:
+        log(f"  \U0001f4ac Silent embed guard: fixed {_silent_embed_fixes} row(s), "
+            f"tagged for EN-source retry.")
+
 
 
 
