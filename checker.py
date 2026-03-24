@@ -1982,6 +1982,96 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         log(f"  💬 Cross-row bleed guard: restored {_bleed_fixes * 2} row(s) from MT, "
             f"queued for Remedy A retry.")
 
+    # ── Structural bleed detector: SV+colon at end-of-row ─────────────────────
+    # Root cause (sort=35/36, sort=75): Gemini appends a narration clause from
+    # row N+1 onto the end of row N, or truncates row N leaving only the
+    # narration prefix. In both cases the output ends with:
+    #     [own content] + [SV verb] + [optional words] + ":"
+    # A row ending with a bare colon is ALWAYS structurally wrong in Italian
+    # fiction — a colon introduces speech, so the speech that follows it must
+    # appear on the SAME row. If it is absent, the speech was displaced.
+    #
+    # Word-count guards cannot detect this when the CDReader MT itself is
+    # contaminated (OUT ≈ MT → no inflation signal), so we detect structurally.
+    #
+    # Guard conditions:
+    #   1. Row role is NOT open/inline_open (those legitimately end with narration+colon)
+    #   2. IT output ends with bare ':'
+    #   3. An SV verb appears in the last 10 words
+    #   4. EN source contains a speech quote — confirms a speech was expected on this row
+    #      (if EN has no speech, a trailing colon is a different issue, not a bleed)
+    #   5. No open-quote follows the SV verb (which would mean speech IS on this row)
+    _SVCOLON_SV = (
+        r'disse|chiese|rispose|replic\u00f2|domand\u00f2|aggiunse|osserv\u00f2|'
+        r'afferm\u00f2|comment\u00f2|esclam\u00f2|sussurr\u00f2|mormor\u00f2|'
+        r'grid\u00f2|sbuff\u00f2|spieg\u00f2|continu\u00f2|not\u00f2|bisbigliò|'
+        r'rifer\u00ec|prosegu\u00ec|dichiar\u00f2|protest\u00f2|interromp\u00f2|'
+        r'balbett\u00f2|inform\u00f2|rivel\u00f2|confess\u00f2|avanz\u00f2|'
+        r'precis\u00f2|specific\u00f2|puntualiz\u00f2|sentenzi\u00f2|ammutol\u00ec|'
+        r'esit\u00f2|rassicur\u00f2|rimprover\u00f2|ammon\u00ec'
+    )
+    _svcolon_fixes = 0
+    _OPEN_ROLES = {'open', 'inline_open'}
+    _qe_role_snap = {r.get('sort'): r.get('_quote_role', 'none') for r in sorted_rows}
+
+    for _bi in range(len(_sorted_keys_pp) - 1):
+        _sn  = _sorted_keys_pp[_bi]
+        _sn1 = _sorted_keys_pp[_bi + 1]
+        if _sn == 0:
+            continue
+        _row_n = _rows_by_sort_pp[_sn]
+        _out_n = _row_n.get('content', '').strip()
+        if not _out_n:
+            continue
+
+        # Condition 1: skip role=open and role=inline_open
+        _role_n = _qe_role_snap.get(_sn, 'none')
+        if _role_n in _OPEN_ROLES:
+            continue
+
+        # Condition 2: IT ends with bare colon
+        if not _out_n.endswith(':'):
+            continue
+
+        # Condition 3: SV verb in last 10 words
+        _tail_last10 = ' '.join(_out_n.split()[-10:])
+        if not re.search(r'\b(?:' + _SVCOLON_SV + r')\b', _tail_last10, re.IGNORECASE):
+            continue
+
+        # Condition 4: EN source contains a speech quote
+        # If EN has no quoted speech, a trailing colon is a different structural
+        # issue (not a bleed displacement). This also eliminates pure stubs like
+        # "Caden osservò:" whose EN has no speech at all.
+        _eng_n = _eng_by_sort.get(_sn, '')
+        if not re.search(r'["\u201c\u201d]', _eng_n):
+            continue
+
+        # Condition 5: no open quote follows the SV verb (speech IS on this row)
+        _sv_m = re.search(r'\b(?:' + _SVCOLON_SV + r')\b', _out_n, re.IGNORECASE)
+        if _sv_m and re.search(r'["\u201c\u00ab]', _out_n[_sv_m.end():]):
+            continue
+
+        # All conditions met: restore N and N+1
+        _row_n1 = _rows_by_sort_pp.get(_sn1)
+        _restore_n  = _restore_for(_sn)
+        _restore_n1 = _restore_for(_sn1) if _row_n1 else ''
+        _src_n  = "peContent" if (_pe_by_sort.get(_sn)  or "").strip() else "MT"
+        _src_n1 = "peContent" if (_pe_by_sort.get(_sn1) or "").strip() else "MT"
+        log(f"  \u26a0\ufe0f  SV+colon bleed: sort={_sn} (role={_role_n}) ends with narration+colon "
+            f"\u2014 speech displaced. Restoring sort={_sn} from {_src_n}, "
+            f"sort={_sn1} from {_src_n1}")
+        _row_n['content'] = _restore_n
+        if _row_n1 and _restore_n1:
+            _row_n1['content'] = _restore_n1
+        _svcolon_fixes += 1
+        if force_retry_sorts is not None:
+            force_retry_sorts[_sn]  = 'bleed'
+            force_retry_sorts[_sn1] = 'bleed'
+
+    if _svcolon_fixes:
+        log(f"  \U0001f4ac SV+colon bleed guard: restored {_svcolon_fixes} pair(s), "
+            f"queued for EN-source retry.")
+
 
 
 
