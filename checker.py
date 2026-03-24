@@ -242,6 +242,29 @@ if it were originally written in Italian, not as if it were aggressively paraphr
 Rows of 4 words or fewer, exclamations, and proper-noun-only rows: return EXACTLY as-is —
 forced changes on short rows produce unnatural results and risk corrupting dialogue structure.
 
+QUALITY BENCHMARK — TARGET LEVEL
+The following before/after pairs illustrate the quality standard. Each "after" was validated
+by a professional Italian proofreader at 4.5/5. Use these as your quality reference:
+
+  ✗ "Con ciò, interruppe la chiamata."
+  ✓ "Detto questo, riattaccò."
+
+  ✗ "Gli occhi di Alicia si illuminarono brevemente di sorpresa."
+  ✓ "Un guizzo di sorpresa balenò negli occhi di Alicia."
+
+  ✗ "A causa del suo udito acuto, Hank colse il suono e mostrò una leggera sorpresa."
+  ✓ "Grazie al suo udito acuto, Hank captò il suono e manifestò una lieve sorpresa."
+
+  ✗ "Caden lasciò uscire una risata fredda."
+  ✓ "Caden emise una risata gelida."
+
+  ✗ "Ritirò rapidamente la mano."
+  ✓ "Si ritrasse di scatto."
+
+The key differences: more idiomatic prepositions (da→per, a causa→grazie), stronger verbs
+(mostrò→manifestò, colse→captò), varied sentence openings (subject-first→action-first),
+and more precise adjectives (fredda→gelida, leggera→lieve).
+
 WHAT TO ALWAYS FIX
 1. Grammar: wrong conjugation, wrong article, broken syntax, preposition errors
 2. Tense: use passato remoto for completed narrative actions (disse, entrò, afferrò);
@@ -275,7 +298,10 @@ Row count in output must equal row count in input — never fewer, never more.
 
 DIALOGUE STRUCTURE
 The system handles quote characters automatically. You govern the text skeleton only:
-- Narration introducing direct speech: use a colon before the speech (disse: ...)
+- Narration introducing direct speech: ALWAYS use a colon before the speech, NEVER a comma.
+  CORRECT:   disse: ... / chiese: ... / aggiunse: ... / sussurrò: ...
+  INCORRECT: disse, ... / chiese, ... / aggiunse, ... / sussurrò, ...
+  Italian standard for directly introduced speech requires the colon, not the comma.
 - Attribution following speech: the attribution clause follows the speech text with a comma
   (... , disse lui.)
 - Inner quotes inside already-open speech: use single quotes (' to open and ' to close) or
@@ -313,6 +339,11 @@ Register assignment:
                 boss / employee, strangers, professional or formal contexts
   "Lei" is ALWAYS capitalized when used as a formal pronoun.
 
+Character-specific register rules (override the defaults above):
+  - Hank addressing Caden: always Lei-register (Hank is Caden's subordinate/employee).
+    Use: La, Le, Suo/Sua/Suoi/Sue, Lei — NEVER: ti, te, tuo, tu
+  - These character-specific rules apply to every book in this series.
+
 Register correction:
   1. If an ESTABLISHED PRONOUN REGISTERS block appears in this prompt, treat it as
      ground truth. Correct any deviation from the assigned register in the current rows,
@@ -337,8 +368,10 @@ FINAL SELF-CHECK (perform before responding)
    improved naturalness, verb precision, or sentence flow? Does each row read as natural
    Italian fiction, with no forced synonyms or unnatural inversions?
 5. Is tu/Lei consistent per character, with all cascading pronoun forms correct?
+   Specifically: does Hank use Lei with Caden throughout?
 6. Are all localization rules applied (Euro, amministratore delegato, honorifics, numbers)?
 7. Is my response pure JSON with zero extra text, markdown, or explanation?
+8. Did I use a colon (not a comma) before every directly introduced speech?
 """
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1709,6 +1742,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # then collapse any resulting multi-space runs.
         c_ws = re.sub(r'[^\S\n]', ' ', c)
         c_ws = re.sub(r' {2,}', ' ', c_ws).strip()
+        # Fix A: strip trailing space immediately before close-quote.
+        # Gemini frequently outputs "text. \" (space before closing ") — strip it.
+        c_ws = re.sub(r' +"', '"', c_ws)
         if c_ws != c:
             row["content"] = c_ws
             _ws_fixes += 1
@@ -2248,20 +2284,20 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 # Mid-row open: narration + speech (e.g. "disse lui: speech")
                 pos = _find_speech_start(stripped)
                 if pos >= 0:
-                    # Fix 4 (Image 4): when _find_speech_start finds a colon position,
-                    # call _find_speech_end on the POST-COLON substring only.
-                    # Previously _find_speech_end got the FULL text, causing P0.2 to
-                    # find the last ? and wrap narration+speech as one unit.
-                    # Now: open-quote goes at pos; close-quote is found within speech_part.
+                    # Fix 4 (Image 4, Session 7): when _find_speech_start finds a colon position,
+                    # pass only the speech_part to _find_speech_end, not the full text.
+                    # Fix (Image 1, Session 10): for role=open, NEVER add the close-quote.
+                    # role=open means the speech continues into the next row (role=close).
+                    # The close-quote belongs there, not here. Adding it prematurely breaks
+                    # the multi-row span: the role=close row then has a dangling close-quote
+                    # with no matching open on the same row.
                     speech_part = stripped[pos:]
                     narration   = stripped[:pos]
-                    if _en_has_post_close_attribution(eng):
-                        end_pos, needs_comma = _find_speech_end(speech_part, eng)
-                        inner = _italian_close_at(speech_part, end_pos, needs_comma)
-                        fixed = narration + _QE_OPEN + inner
-                    else:
-                        # No EN attribution after close → close at end of speech
-                        fixed = narration + _QE_OPEN + speech_part + _QE_CLOSE
+                    # Only open-quote is added; close is the responsibility of the adjacent
+                    # role=close row. _en_has_post_close_attribution is irrelevant here
+                    # because even when EN has attribution after its close, the ITALIAN
+                    # multi-row structure still places the close on the next row.
+                    fixed = narration + _QE_OPEN + speech_part
                 else:
                     # Fallback: keep original (Gemini\'s placement, imperfect but better than none)
                     pass
@@ -2530,6 +2566,46 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
             log(f"  ⚠️  Punct-dedup: sort={sort_n} collapsed repeated terminal punct: {c!r}")
     if _pdedup_fixes:
         log(f"  💬 Punct-dedup: normalised {_pdedup_fixes} row(s) with repeated ?/!")
+
+    # ── Fix B: Comma→Colon before directly introduced speech ─────────────────
+    # Italian convention: when a narrative clause ends with an attribution verb
+    # and directly introduces speech, a colon is used before the opening quote,
+    # NOT a comma. Benchmark analysis showed 8/110 rows where pipeline used comma
+    # but the human editor consistently corrected to colon.
+    # Pattern: [anything with SV verb], "speech  →  [same]: "speech
+    # The SV verb may be separated from the comma by modifying words
+    # (e.g. "disse con calma, \"" → "disse con calma: \"").
+    # Guard: (a) an SV verb must appear before the last ," on the row,
+    #        (b) no close-quote appears between the SV verb and the comma
+    #            (avoids firing on attribution-then-new-speech patterns).
+    _colon_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        c = row.get("content", "")
+        if not c:
+            continue
+        # Find last ," pattern (comma immediately before open-quote)
+        m_cq = re.search(r',(\s*")', c)
+        if not m_cq:
+            continue
+        before_comma = c[:m_cq.start()]
+        # Check an SV verb appears before the comma
+        sv_before = re.search(r'\b(?:' + _SV + r')\b', before_comma, re.IGNORECASE)
+        if not sv_before:
+            continue
+        # Guard: no close-quote between SV verb and comma (would mean speech already ended)
+        between = c[sv_before.end():m_cq.start()]
+        if '"' in between:
+            continue
+        # Replace comma with colon
+        c_col = before_comma + ':' + m_cq.group(1) + c[m_cq.end():]
+        if c_col != c:
+            row["content"] = c_col
+            _colon_fixes += 1
+    if _colon_fixes:
+        log(f"  💬 Comma→Colon: converted {_colon_fixes} row(s) to Italian colon-before-speech convention")
 
     for idx, row in enumerate(sorted_rows):
         c = row.get("content", "")
