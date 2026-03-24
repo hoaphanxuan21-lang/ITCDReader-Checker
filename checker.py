@@ -1165,8 +1165,15 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
     """
     _input_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
     _eng_by_sort_ur = {r.get("sort", i): r.get("original", "") for i, r in enumerate(input_data)}
+    _pe_by_sort_ur  = {r.get("sort", i): r.get("pe_content", "") for i, r in enumerate(input_data)}
     mt_by_sort = {r.get("sort", i): (r.get("machineChapterContent") or r.get("modifChapterContent") or "")
                   for i, r in enumerate(rows)}
+
+    def _restore_for_ur(sort_n):
+        """peContent if non-empty, else machineChapterContent from rows."""
+        pe = (_pe_by_sort_ur.get(sort_n) or "").strip()
+        return pe if pe else mt_by_sort.get(sort_n, "")
+
     _bleed_sorts = bleed_sorts or {}
 
     # ── Collect all rows needing retry ────────────────────────────────────────
@@ -1367,14 +1374,24 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
             # EN-primary re-bleed guard: if Gemini still returned inflated content
             # despite the EN-source bleed prompt, restore from MT reference.
             # Threshold matches batch Guard 2 EN-primary trigger (2.2x, delta>=4).
+            # Fix 5a: lowered en_w minimum from 3→1 to catch single-word EN rows
+            # (e.g. EN="And?" = 1w, MT=8w contaminated → retry produces 9w bleed).
+            # The >=3 minimum previously excluded exactly the rows most vulnerable
+            # to CDReader MT boundary contamination.
             _en_w_ur = len((_eng_by_sort_ur.get(sort_n) or "").split())
             _out_w_ur = len(new_content.split())
-            if (_en_w_ur >= 3
+            if (_en_w_ur >= 1
                     and _out_w_ur > _en_w_ur * 2.2  # lowered 2.5→2.2 (matches batch guard)
                     and (_out_w_ur - _en_w_ur) >= 4):
+                _restore_ur = _restore_for_ur(sort_n)
+                _restore_src_ur = "peContent" if (_pe_by_sort_ur.get(sort_n) or "").strip() else "MT"
                 log(f"    ⚠️  sort={sort_n}: retry re-bleed detected "
-                    f"({_out_w_ur}w vs EN={_en_w_ur}w) — keeping MT")
-                # keep current MT content (already in rephrased_by_sort from _post_process)
+                    f"({_out_w_ur}w vs EN={_en_w_ur}w) — keeping {_restore_src_ur}")
+                # Restore to peContent (or MT if no peContent) rather than keeping bleed output
+                for _rr in all_rephrased:
+                    if _rr.get("sort") == sort_n:
+                        _rr["content"] = _restore_ur
+                        break
                 continue
             if new_content != current_out:
                 new_sim = _row_sim(new_content, ref_text) if "similar" in reason else 0
@@ -1710,8 +1727,19 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
     ensuring all output gets the same treatment (Pass QE, comma rules, glossary, etc.).
     """
     # Build lookup dicts from input_data (used throughout all passes)
-    _mt_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
-    _eng_by_sort = {r.get("sort", i): r.get("original", "") for i, r in enumerate(input_data)}
+    _mt_by_sort  = {r.get("sort", i): r.get("content", "")           for i, r in enumerate(input_data)}
+    _pe_by_sort  = {r.get("sort", i): r.get("pe_content", "")        for i, r in enumerate(input_data)}
+    _eng_by_sort = {r.get("sort", i): r.get("original", "")          for i, r in enumerate(input_data)}
+
+    def _restore_for(sort_n):
+        """Return the best safe restore content for sort_n.
+
+        Prefers peContent (previous human post-edit) over machineChapterContent (MT)
+        because peContent is human-bounded and free of CDReader MT boundary
+        contamination. Falls back to MT when peContent is empty/missing.
+        """
+        pe = (_pe_by_sort.get(sort_n) or "").strip()
+        return pe if pe else _mt_by_sort.get(sort_n, "")
 
     comma_fixes = 0
     comma_adds = 0
@@ -1742,9 +1770,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # then collapse any resulting multi-space runs.
         c_ws = re.sub(r'[^\S\n]', ' ', c)
         c_ws = re.sub(r' {2,}', ' ', c_ws).strip()
-        # Fix A: strip trailing space immediately before close-quote.
-        # Gemini frequently outputs "text. \" (space before closing ") — strip it.
-        c_ws = re.sub(r' +"', '"', c_ws)
+        # Fix A: strip trailing space before close-quote ONLY when preceded by
+        # terminal punctuation (.!?). This removes spurious "text. \" → "text."
+        # but PRESERVES the legitimate space in 'disse: "speech"' → stays as-is.
+        # Old pattern r' +"' was too broad — it also stripped the colon space.
+        c_ws = re.sub(r'(?<=[.!?]) +"', '"', c_ws)
         if c_ws != c:
             row["content"] = c_ws
             _ws_fixes += 1
@@ -1772,13 +1802,14 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         sort_n = row.get("sort")
         out    = row.get("content", "").strip()
         eng_s  = _eng_by_sort.get(sort_n, "")
-        mt_s   = _mt_by_sort.get(sort_n, "")
+        mt_s      = _mt_by_sort.get(sort_n, "")
+        restore_s = _restore_for(sort_n)  # peContent if available, else MT
         # Guard 2: restore empty/whitespace rows from MT
         if not out:
             if mt_s:
-                row["content"] = mt_s
+                row["content"] = restore_s
                 _bgs_confusion_fixes += 1
-                log(f"  ⚠️  Empty row: sort={sort_n} restored from MT {mt_s[:60]!r}")
+                log(f"  ⚠️  Empty row: sort={sort_n} restored from {'peContent' if (_pe_by_sort.get(sort_n) or '').strip() else 'MT'} {restore_s[:60]!r}")
             continue
         if not eng_s or not mt_s: continue
         # General row-misalignment guard:
@@ -1813,9 +1844,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # (attribution followed by colon then speech). A true BGS has no colon+uppercase.
         _has_colon_speech = bool(re.search(r':\s+[A-ZÀÈÉÌÒÙ]', out))
         if (_is_bgs_raw or _is_bgs_unquoted) and not _eng_is_attribution and not _has_colon_speech:
-            row["content"] = mt_s
+            row["content"] = restore_s
             _bgs_confusion_fixes += 1
-            log(f"  ⚠️  BGS confusion: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
+            log(f"  ⚠️  BGS confusion: sort={sort_n} restored from {out!r} to {'peContent' if (_pe_by_sort.get(sort_n) or '').strip() else 'MT'} {restore_s[:60]!r}")
             continue
         # Fix 3b: lowercase-first output guard.
         # Root cause (SS4): Gemini displaces narrative from row N into row N+1, whose
@@ -1825,9 +1856,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # row is always wrong. Guard: if Italian output starts lowercase AND the MT for
         # that row starts uppercase, the content is displaced — restore from MT.
         if out and out[0].islower() and mt_s and mt_s.strip() and mt_s.strip()[0].isupper():
-            row["content"] = mt_s
+            row["content"] = restore_s
             _bgs_confusion_fixes += 1
-            log(f"  ⚠️  Lowercase-first displaced: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
+            log(f"  ⚠️  Lowercase-first displaced: sort={sort_n} restored from {out!r} to {'peContent' if (_pe_by_sort.get(sort_n) or '').strip() else 'MT'} {restore_s[:60]!r}")
             continue
         # Fix 3c: EN-reference lowercase guard.
         # Root cause (Image 1): CDReader's MT itself can carry a boundary error — the
@@ -1851,13 +1882,47 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         _out_lc_3c    = bool(out and out[0].islower())
         _out_long_3c  = len(out.split()) >= 4
         if _out_lc_3c and _eng_uc_start and _eng_no_quote and _out_long_3c:
-            row["content"] = mt_s
+            row["content"] = restore_s
             _bgs_confusion_fixes += 1
-            log(f"  ⚠️  Fix3c EN-ref lc: sort={sort_n} out_lc+eng_uc — restored from MT {mt_s[:60]!r}")
+            log(f"  ⚠️  Fix3c EN-ref lc: sort={sort_n} out_lc+eng_uc — restored from {'peContent' if (_pe_by_sort.get(sort_n) or '').strip() else 'MT'} {restore_s[:60]!r}")
             if force_retry_sorts is not None:
                 force_retry_sorts[sort_n] = 'bleed'
     if _bgs_confusion_fixes:
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
+
+    # ── Fix 1: Strip leading comma from attribution-only rows ─────────────────
+    # Root cause (sort=12): when the previous row ends with a close-quote speech,
+    # the adjacent attribution row (EN="She declined sharply.") has no speech content.
+    # Gemini treats it as inline continuation and prefixes a comma: ", rispose con tono secco."
+    # The BGS guard may or may not fire, but even if it restores to MT, the MT itself
+    # may have the same leading comma from the original CDReader MT.
+    # Guard: only strip when (a) output starts with ',' AND (b) EN is an attribution clause
+    # (no opening quote, short, contains a speech verb). This ensures we don't strip
+    # legitimate commas from continuation speech rows.
+    _leading_comma_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        c = row.get("content", "")
+        eng_row = (row.get("original") or "").strip()
+        if not c.startswith(","):
+            continue
+        # Check EN is attribution-only (no speech quote, short, has SV verb)
+        _eng_no_open_q = not eng_row.lstrip().startswith('"') and '"' not in eng_row[:3]
+        _eng_short = len(eng_row.split()) <= 12
+        _eng_has_sv = bool(re.search(
+            r'\b(?:said|asked|replied|answered|whispered|shouted|muttered|remarked|'
+            r'added|continued|insisted|exclaimed|cried|explained|told|warned|'
+            r'declined|snapped|sighed|laughed|nodded|smiled|breathed|called)\b',
+            eng_row, re.IGNORECASE))
+        if _eng_no_open_q and _eng_short and _eng_has_sv:
+            stripped_c = re.sub(r'^,\s*', '', c)
+            row["content"] = stripped_c
+            _leading_comma_fixes += 1
+            log(f"  ⚠️  Fix1 leading-comma: sort={sort_n} stripped leading ',' → {stripped_c[:50]!r}")
+    if _leading_comma_fixes:
+        log(f"  💬 Fix1: stripped leading comma from {_leading_comma_fixes} attribution row(s).")
 
     # ── Cross-row bleed guard (checker-27 Fix 2) ──────────────────────────
     # Detects Gemini row-merge errors: row N absorbs speech from row N+1,
@@ -1900,10 +1965,15 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         #   (b) N+1 starts lowercase AND is shorter than MT — partial bleed (bled words
         #       didn't fully deplete N+1 but did remove its opening content)
         if _inflated and (_deflated or (_starts_lc and _shorter)):
+            _restore_sn  = _restore_for(_sn)
+            _restore_sn1 = _restore_for(_sn1)
+            _src_n  = "peContent" if (_pe_by_sort.get(_sn)  or "").strip() else "MT"
+            _src_n1 = "peContent" if (_pe_by_sort.get(_sn1) or "").strip() else "MT"
             log(f"  ⚠️ Cross-row bleed: sort={_sn} ({_wc_mt_n}→{_wc_out_n}w) "
-                f"+ sort={_sn1} lc={_starts_lc} deflated={_deflated} ({_wc_mt_n1}→{_wc_out_n1}w) — restoring both from MT")
-            _row_n['content']  = _mt_n
-            _row_n1['content'] = _mt_n1
+                f"+ sort={_sn1} lc={_starts_lc} deflated={_deflated} ({_wc_mt_n1}→{_wc_out_n1}w) "
+                f"— restoring from {_src_n}/{_src_n1}")
+            _row_n['content']  = _restore_sn
+            _row_n1['content'] = _restore_sn1
             _bleed_fixes += 1
             if force_retry_sorts is not None:
                 force_retry_sorts[_sn]  = 'bleed'  # Finding 3
@@ -2273,7 +2343,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
             # output starts with an attribution/speech verb, the speech content was
             # displaced to an adjacent row. Injecting " around attribution text produces
             # malformed output. Skip quote injection.
-            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')', stripped, re.IGNORECASE):
+            # Fix 4 (sort=80): colon+speech check before skipping attribution-start.
+            # A row starting with SV verb that also has ': [Uppercase/quote]' content
+            # is a valid inverted-structure row — route to inverted path, don't skip.
+            _attr_colon_speech = bool(re.search(r':\s*[A-ZÀÈÉÌÒÙ"]', stripped))
+            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')', stripped, re.IGNORECASE) and not _attr_colon_speech:
                 log(f"  ⚠️  Quote reinject: sort={sort_n} role={role} — IT starts with "
                     f"attribution verb but EN starts with speech. Skipping quote injection.")
                 fixed = stripped
@@ -2314,7 +2388,8 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         elif role == "both":
             # Attribution-start guard (same as role=="open" above): skip quote injection
             # when DE starts with an attribution verb but EN starts with speech quotes.
-            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')\b', stripped, re.IGNORECASE):
+            _attr_colon_speech_both = bool(re.search(r':\s*[A-ZÀÈÉÌÒÙ"]', stripped))
+            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')\b', stripped, re.IGNORECASE) and not _attr_colon_speech_both:
                 log(f"  ⚠️  Quote reinject: sort={sort_n} role={role} — DE starts with "
                     f"attribution verb but EN starts with speech. Skipping quote injection.")
                 fixed = stripped
@@ -2917,6 +2992,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r.get("machineChapterContent") or r.get("modifChapterContent") or r.get("peContent") or ""
         for r in rows
     ]
+    # peContent = previous human post-editor's accepted version.
+    # Used as RESTORE SOURCE by guards (not as Gemini input).
+    # Preferred over machineChapterContent for restores because it is human-bounded
+    # and free of CDReader MT boundary contamination.
+    pe_contents = [
+        r.get("peContent") or ""
+        for r in rows
+    ]
     # English source (chapterConetnt) used as context only, not as content to rephrase
     english_originals = [
         r.get("chapterConetnt") or r.get("eContent") or r.get("eeContent") or ""
@@ -3013,6 +3096,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             "original": english_originals[i],   # English source — context for Gemini
             "content": raw_contents[i],           # Italian machine translation — primary text to rephrase
             "machine_translation": raw_contents[i],  # same Italian text used by similarity guard
+            "pe_content": pe_contents[i],         # previous human post-edit — used as restore source by guards
             "_quote_role": quote_roles[i],
         }
         for i, r in enumerate(rows)
@@ -3509,12 +3593,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                              and _out_w >= _en_w + 3)
             if _mt_trigger or _en_primary_trigger or _en_trigger or _tiny_trigger:
                 _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
-                if _mt_orig:
+                _pe_orig = next((r.get("pe_content", "") for r in batch if r.get("sort") == _s), "")
+                _restore_orig = (_pe_orig.strip() or _mt_orig)  # prefer peContent over MT
+                if _restore_orig:
                     _trigger_src = ("MT" if _mt_trigger else
                                     ("EN-PRIMARY" if _en_primary_trigger else
                                      ("EN" if _en_trigger else "TINY")))
-                    log(f"  \u26a0\ufe0f  Bleed guard: sort={_s} inflated ({_out_w}w vs MT={_inp_w}w EN={_en_w}w, trigger={_trigger_src}) \u2014 restored from MT")
-                    _r["content"] = _mt_orig
+                    _restore_src = "peContent" if _pe_orig.strip() else "MT"
+                    log(f"  \u26a0\ufe0f  Bleed guard: sort={_s} inflated ({_out_w}w vs MT={_inp_w}w EN={_en_w}w, trigger={_trigger_src}) \u2014 restored from {_restore_src}")
+                    _r["content"] = _restore_orig
                     _bleed_count += 1
         if _bleed_count:
             log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
@@ -3604,9 +3691,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                            and _inp_w >= 3)
             if _mt_trigger or _en_trigger:
                 _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
-                if _mt_orig:
-                    log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from MT")
-                    _r["content"] = _mt_orig
+                _pe_orig = next((r.get("pe_content", "") for r in batch if r.get("sort") == _s), "")
+                _restore_orig = (_pe_orig.strip() or _mt_orig)
+                if _restore_orig:
+                    _restore_src_t = "peContent" if _pe_orig.strip() else "MT"
+                    log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from {_restore_src_t}")
+                    _r["content"] = _restore_orig
                     _truncated_sorts.add(_s)
                     _force_retry_sorts[_s] = 'truncated'    # Remedy A: bypass _MAX_RETRIES + dialogue exemption
                     _trunc_count += 1
