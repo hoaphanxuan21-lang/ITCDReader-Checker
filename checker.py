@@ -265,11 +265,27 @@ The key differences: more idiomatic prepositions (da→per, a causa→grazie), s
 (mostrò→manifestò, colse→captò), varied sentence openings (subject-first→action-first),
 and more precise adjectives (fredda→gelida, leggera→lieve).
 
+For attribution and dialogue rows — minimal intervention is correct:
+  ✗ "Senza esitazione, lei disse con voce ferma a Caden."
+  ✓ "Senza esitare, disse con voce ferma a Caden."
+  Key: attribution verbs and speech markers need precision, not restructuring.
+
+ROW BOUNDARY VIOLATION (will cause chapter rejection — never do this):
+  ✗ Row N output:  "Sei interessato ad Alicia?" Caden replicò con un sogghigno:
+    (row N contains its OWN speech PLUS row N+1's narration — WRONG)
+  ✓ Row N output:  "Sei interessato ad Alicia?"
+    (row N contains ONLY its own speech — CORRECT)
+  Each row must contain ONLY the content that belongs to it. Never append narration
+  from the next row, and never leave a trailing colon at the end of a row.
+
 WHAT TO ALWAYS FIX
 1. Grammar: wrong conjugation, wrong article, broken syntax, preposition errors
-2. Tense: use passato remoto for completed narrative actions (disse, entrò, afferrò);
-   use trapassato prossimo for past-of-past backstory (aveva bruciato, avevano attirato).
-   Correct any MT errors where imperfetto is incorrectly used for single completed actions.
+2. Tense: use passato remoto for single punctual completed actions with a clear start
+   and end (entrò, afferrò, disse, scoppiò, rispose). Use trapassato prossimo for
+   past-of-past backstory (aveva bruciato, avevano attirato).
+   Preserve imperfetto for habitual patterns, background states, or ongoing conditions
+   (sapeva, pensava, era, sembrava, voleva) even when these precede the narrative present
+   — imperfetto in these cases is grammatically correct and stylistically appropriate.
    Present and future tenses inside dialogue are correct — do not alter them.
 3. Logic / semantics: where the Italian meaning diverges from the English source
 4. Register: apply THE PRONOUN PROTOCOL below
@@ -298,10 +314,12 @@ Row count in output must equal row count in input — never fewer, never more.
 
 DIALOGUE STRUCTURE
 The system handles quote characters automatically. You govern the text skeleton only:
-- Narration introducing direct speech: ALWAYS use a colon before the speech, NEVER a comma.
-  CORRECT:   disse: ... / chiese: ... / aggiunse: ... / sussurrò: ...
-  INCORRECT: disse, ... / chiese, ... / aggiunse, ... / sussurrò, ...
-  Italian standard for directly introduced speech requires the colon, not the comma.
+- Narration introducing direct speech: when the attribution verb is the main verb of a
+  complete clause (the most common case), use a colon before the speech:
+  CORRECT:   disse: ... / rispose con calma: ... / chiese con curiosità: ...
+  When the introduction is a participial phrase or incomplete clause, a comma is correct:
+  CORRECT:   dicendo, ... / come per giustificarsi, ... / sottovoce, ...
+  INCORRECT: disse, ... / rispose, ... (comma after a complete attribution clause)
 - Attribution following speech: the attribution clause follows the speech text with a comma
   (... , disse lui.)
 - Inner quotes inside already-open speech: use single quotes (' to open and ' to close) or
@@ -339,10 +357,6 @@ Register assignment:
                 boss / employee, strangers, professional or formal contexts
   "Lei" is ALWAYS capitalized when used as a formal pronoun.
 
-Character-specific register rules (override the defaults above):
-  - Hank addressing Caden: always Lei-register (Hank is Caden's subordinate/employee).
-    Use: La, Le, Suo/Sua/Suoi/Sue, Lei — NEVER: ti, te, tuo, tu
-  - These character-specific rules apply to every book in this series.
 
 Register correction:
   1. If an ESTABLISHED PRONOUN REGISTERS block appears in this prompt, treat it as
@@ -368,7 +382,6 @@ FINAL SELF-CHECK (perform before responding)
    improved naturalness, verb precision, or sentence flow? Does each row read as natural
    Italian fiction, with no forced synonyms or unnatural inversions?
 5. Is tu/Lei consistent per character, with all cascading pronoun forms correct?
-   Specifically: does Hank use Lei with Caden throughout?
 6. Are all localization rules applied (Euro, amministratore delegato, honorifics, numbers)?
 7. Is my response pure JSON with zero extra text, markdown, or explanation?
 8. Did I use a colon (not a comma) before every directly introduced speech?
@@ -399,10 +412,111 @@ def send_telegram(message):
         log(f"Telegram exception: {e}")
 
 
+# ─── CDReader HTTP helpers (with transient-error retry) ──────────────────────
+# All CDReader API calls use these wrappers instead of raw requests.get/post/put.
+# Only 5xx errors and network timeouts are retried — 4xx responses (auth errors,
+# business logic rejections) are passed through immediately so callers can handle them.
+def _cdreader_get(url, headers, timeout=15):
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+    return resp  # unreachable but satisfies type checkers
+
+def _cdreader_post(url, headers, json=None, data=None, timeout=15):
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=headers, json=json, data=data, timeout=timeout)
+            if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+    return resp
+
+def _cdreader_put(url, headers, data=None, timeout=60):
+    for attempt in range(3):
+        try:
+            resp = requests.put(url, headers=headers, data=data, timeout=timeout)
+            if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+    return resp
+
+
 # ─── Auth ─────────────────────────────────────────────────────────────────────
+# ── CDReader HTTP helpers with retry/backoff ──────────────────────────────────
+# All CDReader API calls use these wrappers. They retry on transient 5xx errors
+# and network timeouts (up to 3 attempts, exponential backoff: 1s, 2s).
+# 4xx errors are NOT retried — they indicate caller errors (bad token, bad payload)
+# and retrying would cause double-claims or duplicate submissions.
+def _cdreader_get(url, headers, timeout=15):
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
+            log(f"  ⚠️  GET timeout (attempt {attempt+1}/3): {url[:80]}")
+            time.sleep(2 ** attempt)
+
+def _cdreader_post(url, headers, json=None, data=None, timeout=15):
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=headers, json=json, data=data, timeout=timeout)
+            if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
+            log(f"  ⚠️  POST timeout (attempt {attempt+1}/3): {url[:80]}")
+            time.sleep(2 ** attempt)
+
+def _cdreader_put(url, headers, data=None, timeout=60):
+    for attempt in range(3):
+        try:
+            resp = requests.put(url, headers=headers, data=data, timeout=timeout)
+            if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout:
+            if attempt == 2:
+                raise
+            log(f"  ⚠️  PUT timeout (attempt {attempt+1}/3): {url[:80]}")
+            time.sleep(2 ** attempt)
+
+
 def login():
     log("Logging in...")
-    resp = requests.post(
+    resp = _cdreader_post(
         f"{BASE_URL}/User/UserLogin",
         headers={**HEADERS, "content-type": "application/json;charset=UTF-8"},
         json={"accountName": ACCOUNT_NAME, "accountPwd": ACCOUNT_PWD, "checked": False},
@@ -427,7 +541,7 @@ def get_books(token):
     log("Fetching book list...")
     all_books, page = [], 1
     while True:
-        resp = requests.post(
+        resp = _cdreader_post(
             f"{BASE_URL}/ObjectBook/AuthorObjectBookList",
             headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
             json={"PageIndex": page, "PageSize": 100,
@@ -453,7 +567,7 @@ def get_books(token):
     return all_books
 
 def get_available_chapters(token, book_id):
-    resp = requests.get(
+    resp = _cdreader_get(
         f"{BASE_URL}/ObjectChapter/Receive?bookId={book_id}&receiveType=2",
         headers=auth_headers(token), timeout=15,
     )
@@ -470,7 +584,7 @@ def get_available_chapters(token, book_id):
     return chapters
 
 def claim_chapter(token, chapter_id):
-    resp = requests.get(
+    resp = _cdreader_get(
         f"{BASE_URL}/ObjectChapter/ForeignReceive?chapter={chapter_id}",
         headers=auth_headers(token), timeout=15,
     )
@@ -503,7 +617,7 @@ def find_chapter_processing_id(token, book, claimed_chapter_name):
     all_chapters_seen = []
     page = 1
     while True:
-        resp = requests.post(
+        resp = _cdreader_post(
             f"{BASE_URL}/ObjectChapter/AuthorChapterList",
             headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
             json={"PageIndex": page, "PageSize": 100,
@@ -557,7 +671,7 @@ def find_chapter_processing_id(token, book, claimed_chapter_name):
 # ─── Phase 3: Fetch data ──────────────────────────────────────────────────────
 def start_chapter(token, chapter_id):
     log(f"  Starting chapter {chapter_id}...")
-    resp = requests.get(
+    resp = _cdreader_get(
         f"{BASE_URL}/ObjectCatChapter/StartChapter?chapterId={chapter_id}&ScheduleStatusType=2",
         headers=auth_headers(token), timeout=15,
     )
@@ -572,7 +686,7 @@ def start_chapter(token, chapter_id):
 
 def get_chapter_rows(token, chapter_id):
     log(f"  Fetching rows for chapter {chapter_id}...")
-    resp = requests.get(
+    resp = _cdreader_get(
         f"{BASE_URL}/ObjectCatChapter/CatChapterList?flowType=2&chapterId={chapter_id}&ToLanguage={TO_LANGUAGE}&FromLanguage=0",
         headers=auth_headers(token), timeout=15,
     )
@@ -610,7 +724,7 @@ def get_glossary(token, object_book_id):
     log(f"  Fetching glossary for book {object_book_id}...")
     all_terms, page = [], 1
     while True:
-        resp = requests.post(
+        resp = _cdreader_post(
             f"{BASE_URL}/ObjectDictionary/DictionaryList",
             headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
             json={"PageIndex": page, "PageSize": 100,
@@ -675,13 +789,13 @@ _SV_CORE = (
     # Absent from previous list; caused fallback-to-end-of-text quote wrapping (Image 2).
     r"propose|sugger\u00ec|"
     # Verbs of coaxing/flattering with object-pronoun construction (lo blandì, la sedusse…)
-    r"bland\u00ec|sedusse|lusingò|"
+    r"bland\u00ec|sedusse|lusing\u00f2|"
     # Verbs of calling out / commenting — frequently used in fiction, absent from previous list.
     # chiamò (chiamare = to call out), commentò (commentare = to comment/remark)
     # aggiunse is already present; adding more commentary verbs:
-    r"chiam\u00f2|comment\u00f2|esclam\u00f2|not\u00f2|conclud\u00e8|"
+    r"chiam\u00f2|comment\u00f2|not\u00f2|conclud\u00e8|"
     r"ricord\u00f2|ricord\u00e8|ammise|confid\u00f2|ipotizz\u00f2|avanz\u00f2|"
-    r"osserv\u00f2|precis\u00f2|sottopose|enunci\u00f2|articol\u00f2|"
+    r"precis\u00f2|sottopose|enunci\u00f2|articol\u00f2|"
     # Further common verbs absent from previous list (session 7)
     # specific\u00f2 (specificare=to specify), puntualiz\u00f2 (to clarify/point out),
     # ammutol\u00ec (to fall silent — used as attribution), sentenzi\u00f2 (to pronounce)
@@ -805,12 +919,12 @@ _SYNONYMS = [
     (r'\banche\b', 'pure'),
     (r'\bper\u00f2\b', 'tuttavia'),
     (r'\bquindi\b', 'perci\u00f2'),
-    (r'\bpoi\b', 'in seguito'),
+    (r'\bpoi\b', 'quindi'),  # quindi: natural narrative connector
     (r'\bsolo\b', 'soltanto'),
     (r'\bancora\b', 'tuttora'),
-    (r'\bgi\u00e0\b', 'ormai'),
+    # già → ormai REMOVED: opposite temporal implication in many contexts
     (r'\bora\b', 'adesso'),
-    (r'\bsempre\b', 'costantemente'),
+    (r'\bsempre\b', 'tuttora'),  # tuttora: literary "still/always"
     (r'\bcos\u00ec\b', 'talmente'),
     (r'\bdi nuovo\b', 'nuovamente'),
     (r'\bforse\b', 'probabilmente'),
@@ -845,7 +959,7 @@ _SYNONYMS = [
     (r'\bdisse\b', 'afferm\u00f2'),
     (r'\bchiese\b', 'domand\u00f2'),
     (r'\brispose\b', 'replic\u00f2'),
-    (r'\bsorrise\b', 'sogghign\u00f2'),
+    (r'\bsorrise\b', 'sorr\u00ec'),  # sorrì: safe variant passato remoto of sorridere
     (r'\band\u00f2\b', 'si diresse'),
     (r'\bvenne\b', 'giunse'),
     (r'\bguard\u00f2\b', 'osserv\u00f2'),
@@ -855,7 +969,7 @@ _SYNONYMS = [
     (r'\bsapeva\b', 'era consapevole'),
     (r'\bprese\b', 'afferr\u00f2'),
     (r'\bmise\b', 'collocò'),
-    (r'\btrov\u00f2\b', 'rinvenne'),
+    (r'\btrov\u00f2\b', 'scopr\u00ec'),  # scoprì: neutral discovery verb
     (r'\bvide\b', 'scorse'),
     (r'\bsent\u00ec\b', 'avvert\u00ec'),
     (r'\bpens\u00f2\b', 'riflett\u00e9'),
@@ -911,9 +1025,17 @@ def _find_synonym_pair(text):
         return any(qs <= match_start and match_end <= qe + 1
                    for qs, qe in _quote_ranges)
 
+    def _in_attribution_zone(match_start, match_end):
+        """True if the match is within ~20 chars of a quote boundary.
+        Prevents substituting words in attribution clauses (disse piano →
+        disse sommessamente) which would introduce register-wrong vocabulary
+        immediately adjacent to the dialogue they introduce or follow."""
+        nearby = text[max(0, match_start - 20): match_end + 20]
+        return bool(re.search(r'["\u201c\u201d]', nearby))
+
     for pattern, replacement in _SYNONYMS:
         m = re.search(pattern, text)
-        if m and not _in_quotes(m.start(), m.end()):
+        if m and not _in_quotes(m.start(), m.end()) and not _in_attribution_zone(m.start(), m.end()):
             return (m.group(0), replacement)
     return None
 
@@ -946,9 +1068,14 @@ def _deterministic_change(text):
         return any(qs <= match_start and match_end <= qe + 1
                    for qs, qe in _quote_ranges)
 
+    def _in_attribution_zone(match_start, match_end):
+        """Same attribution-zone guard as _find_synonym_pair."""
+        nearby = text[max(0, match_start - 20): match_end + 20]
+        return bool(re.search(r'["\u201c\u201d]', nearby))
+
     for pattern, replacement in _SYNONYMS:
         m = re.search(pattern, text)
-        if m and not _in_quotes(m.start(), m.end()):
+        if m and not _in_quotes(m.start(), m.end()) and not _in_attribution_zone(m.start(), m.end()):
             return re.sub(pattern, replacement, text, count=1)
     # No synonym matched (very short row, exclamation, single name, etc.) — return as-is.
     # Comma→semicolon was removed: it frequently broke syntax where a comma is
@@ -1101,10 +1228,16 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                     break  # skip rest of this group, try next account
                 if result is not None:
                     return result
-                # Empty/None result but no 429 — try next key in group
+                # Empty/None result but no 429 — content-blocked or empty candidates.
+                # No quota consumed — try next key in same group before giving up.
+                # (The bare `break` here previously abandoned the group on any None result,
+                # causing unnecessary fallback to deterministic change on transient issues.)
+                log(f"    ℹ️ Account {_ACCOUNT_LABELS[gi]} key returned None (non-429) — trying next key in group")
             except Exception as e:
                 log(f"    ⚠️ Account {_ACCOUNT_LABELS[gi]} key error: {e}")
-            break  # only try ONE key per group (success or fail), then move to next group
+                # On exception, don't burn remaining keys in this group — move to next account
+                break
+        # After trying all cooled keys in this group with no success, move to next group
 
     # ── Second pass: wait for soonest key across non-blocked groups ────────
     if deadline and time.time() > deadline:
@@ -1153,7 +1286,8 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
 
     return None
 
-def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
+def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
+                   glossary_terms=None, register_block=None):
     """Identify and retry rows that are verbatim, too similar to MT, or truncated.
 
     bleed_sorts: dict of sort → reason ('bleed'|'bgs'|'truncated') from _force_retry_sorts.
@@ -1285,12 +1419,23 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None):
             _en_src = _eng_by_sort_ur.get(sort_n, "")
             _mt_src = ref_text  # MT (may be boundary-corrupt — used as secondary context only)
             if _en_src.strip():
+                # Build per-row glossary: terms whose key appears in this row's EN+MT text
+                _row_text_lower = (_en_src + " " + _mt_src).lower()
+                _row_gloss_terms = [t for t in (glossary_terms or [])
+                                    if (t.get("dictionaryKey") or "").strip().lower() in _row_text_lower
+                                    or (t.get("enSurname") or "").strip().lower() in _row_text_lower]
+                _row_gloss_block = format_glossary_for_prompt(_row_gloss_terms) if _row_gloss_terms else ""
+                _reg_block = (register_block or "").strip()
                 prompt = (
                     "Sei un editor italiano esperto. Questa riga è stata ripristinata dalla "
                     "traduzione automatica perché l'output precedente conteneva contenuto da una "
                     "riga adiacente (bleed di riga) o solo una clausola di attribuzione.\n\n"
                     "FONTE INGLESE (riferimento principale):\n" + _en_src + "\n\n"
                     "TRADUZIONE AUTOMATICA (italiano — riferimento secondario):\n" + _mt_src + "\n\n"
+                    + (f"GLOSSARIO (nomi e termini del libro):\n{_row_gloss_block}\n\n" if _row_gloss_block else "")
+                    + (f"REGISTRO PRONOMI:\n{_reg_block}\n\n" if _reg_block else "")
+                    + "Usa i due punti (non la virgola) prima del discorso diretto introdotto "
+                    "da un verbo di attribuzione.\n"
                     "Produci una post-editing italiana corretta e completa SOLO per questa riga. "
                     "NON includere contenuto da righe adiacenti. "
                     "Apporta 2-3 miglioramenti redazionali: verbi più precisi, flusso migliore, "
@@ -2004,7 +2149,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
     _SVCOLON_SV = (
         r'disse|chiese|rispose|replic\u00f2|domand\u00f2|aggiunse|osserv\u00f2|'
         r'afferm\u00f2|comment\u00f2|esclam\u00f2|sussurr\u00f2|mormor\u00f2|'
-        r'grid\u00f2|sbuff\u00f2|spieg\u00f2|continu\u00f2|not\u00f2|bisbigliò|'
+        r'grid\u00f2|sbuff\u00f2|spieg\u00f2|continu\u00f2|not\u00f2|bisbigli\u00f2|'
         r'rifer\u00ec|prosegu\u00ec|dichiar\u00f2|protest\u00f2|interromp\u00f2|'
         r'balbett\u00f2|inform\u00f2|rivel\u00f2|confess\u00f2|avanz\u00f2|'
         r'precis\u00f2|specific\u00f2|puntualiz\u00f2|sentenzi\u00f2|ammutol\u00ec|'
@@ -3353,6 +3498,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             # for efficient multi-word substring matching.
             # batch_text is already lowercase from the join above.
             def _term_in_batch(term):
+                # Always include proper names (characters, places, ranks) regardless of
+                # whether the literal name appears in this batch — characters referred to
+                # only as lei/lui would otherwise lose their glossary entry.
+                if term.get("enSurname") or term.get("dictionarySurname"):
+                    return True
                 key = (term.get("dictionaryKey") or "").strip().lower()
                 sur = (term.get("enSurname") or "").strip().lower()
                 return (key and key in batch_text) or (sur and sur in batch_text)
@@ -3881,7 +4031,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     # Unified retry: identify and re-request verbatim, similar, or truncated rows
     all_rephrased = _unified_retry(sorted_rows, input_data, rows,
-                                    bleed_sorts=_force_retry_sorts)
+                                    bleed_sorts=_force_retry_sorts,
+                                    glossary_terms=glossary_terms,
+                                    register_block=_register_block)
 
     # Re-run post-processing on retry output to ensure retried rows get
     # the same treatment (Pass QE, comma rules, glossary enforcement, etc.)
@@ -3967,7 +4119,7 @@ def submit_chapter(token, chapter_id, rephrased_rows, original_rows):
             "contentShowData": rephrased_content,
         })
 
-    resp = requests.put(
+    resp = _cdreader_put(
         f"{BASE_URL}/ObjectCatChapter/CreateExeclAsync?chapterId={chapter_id}&status=1",
         headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -3980,7 +4132,7 @@ def submit_chapter(token, chapter_id, rephrased_rows, original_rows):
 
 def finish_chapter(token, chapter_id):
     log(f"  Finishing chapter {chapter_id}...")
-    resp = requests.get(
+    resp = _cdreader_get(
         f"{BASE_URL}/ObjectCatChapter/UpdateForeign?id={chapter_id}&score=0",
         headers=auth_headers(token), timeout=15,
     )
@@ -4001,7 +4153,7 @@ def close_task(token, task_id):
         return False
     log(f"  Closing Task Center task {task_id}...")
     try:
-        resp = requests.get(
+        resp = _cdreader_get(
             f"{BASE_URL}/TaskCenter/UpdateStatus?id={task_id}&status=1",
             headers=auth_headers(token),
             timeout=10,
@@ -4032,7 +4184,7 @@ def is_recheck_chapter(token, chapter_id):
     By checking Task Center after claiming, we detect this and abort before processing.
     """
     try:
-        resp = requests.post(
+        resp = _cdreader_post(
             f"{BASE_URL}/TaskCenter/AuthorTaskCenterList",
             headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
             json={"PageIndex": 1, "PageSize": 10,
@@ -4040,7 +4192,6 @@ def is_recheck_chapter(token, chapter_id):
                   "taskType": [], "taskTitle": ""},
             timeout=15,
         )
-        resp.raise_for_status()
         body = resp.json()
         data = body.get("data", {})
         tasks = (
@@ -4080,7 +4231,7 @@ def find_active_chapter(token, books):
     log("  Checking Task Center for active chapter...")
 
     try:
-        resp = requests.post(
+        resp = _cdreader_post(
             f"{BASE_URL}/TaskCenter/AuthorTaskCenterList",
             headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
             json={"PageIndex": 1, "PageSize": 10,
@@ -4088,7 +4239,6 @@ def find_active_chapter(token, books):
                   "taskType": [], "taskTitle": ""},
             timeout=15,
         )
-        resp.raise_for_status()
         body = resp.json()
         data = body.get("data", {})
         tasks = (
@@ -4379,344 +4529,359 @@ def _run_inner(token):
         raise _AlreadyProcessedRetry(f"Chapter {proc_id} is a recheck")
 
     # Start chapter (unlock for editing)
-    start_chapter(token, proc_id)
-    time.sleep(2)
+    _chapter_started = False
+    try:
+        start_chapter(token, proc_id)
+        _chapter_started = True
+        time.sleep(2)
 
-    # Fetch rows
-    rows = get_chapter_rows(token, proc_id)
-    if not rows:
-        msg = f"⚠️ <b>CDReader:</b> No rows fetched for {ch_name}. Manual action required."
-        send_telegram(msg)
-        return
-
-    # ── Already-processed detection ─────────────────────────────────────────
-    # Compare modifChapterContent vs machineChapterContent across rows.
-    # On a fresh chapter, these are identical (CDReader pre-populates modif with MT).
-    # After our pipeline submits, modifChapterContent is updated with our edits.
-    # If a significant fraction already differs, the chapter was already processed
-    # by a previous run — skip to avoid duplicate work and API waste.
-    # OVERRIDE MODE: skip this guard — the whole point of override is to re-process.
-    if status != "override":
-        _edited_count = 0
-        _total_check = 0
-        for r in rows:
-            if r.get("sort", 0) == 0:
-                continue
-            _mt = (r.get("machineChapterContent") or "").strip()
-            _mod = (r.get("modifChapterContent") or "").strip()
-            if _mt and _mod:
-                _total_check += 1
-                if _mt != _mod:
-                    _edited_count += 1
-        _edit_pct = (_edited_count / _total_check * 100) if _total_check > 0 else 0
-        if _total_check > 0 and _edit_pct > 30:
-            log(f"  ⚠️  Already-processed guard: {_edited_count}/{_total_check} rows ({_edit_pct:.0f}%) "
-                f"already differ from MT — chapter was edited by a previous run. Skipping.")
-            log(f"  Finishing chapter {proc_id} without re-submitting...")
-            # Finish the chapter to clear the Task Center entry
-            try:
-                finish_chapter(token, proc_id)
-            except Exception:
-                pass
-            if task_id:
-                try:
-                    close_task(token, task_id)
-                except Exception:
-                    pass
-            raise _AlreadyProcessedRetry(f"Chapter {proc_id} already processed")
-    else:
-        log(f"  ℹ️  Override mode — skipping already-processed guard.")
-
-    content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
-    if not content_rows:
-        log(f"  ⚠️  No content rows found — proceeding anyway.")
-
-    # Fetch glossary
-    glossary = get_glossary(token, book_id)
-
-    # Rephrase with Gemini
-    log(f"  Rephrasing {len(rows)} rows with Gemini...")
-    rephrased = rephrase_with_gemini(rows, glossary, book_name)
-
-    if not rephrased:
-        msg = (
-            f"❌ <b>CDReader:</b> Gemini rephrasing failed for {ch_name}.\n"
-            f"Manual action required."
-        )
-        send_telegram(msg)
-        return
-
-    # ── Post-process: replace English quotes with Italian quotes ─────────────────
-    # Groq and sometimes Gemini use " instead of „/". Fix deterministically.
-    quote_fixes = 0
-    for row in rephrased:
-        c = row.get("content", "")
-        if '"' not in c:
-            continue
-        # Replace paired English quotes: "text" → „text"
-        # Strategy: first " in a pair → „, second " → "
-        fixed = ""
-        in_quote = False
-        i = 0
-        while i < len(c):
-            ch = c[i]
-            if ch == '"':
-                if not in_quote:
-                    fixed += '"'  # " opening (straight quote)
-                    in_quote = True
-                else:
-                    fixed += '"'  # " closing (straight quote)
-                    in_quote = False
-            else:
-                fixed += ch
-            i += 1
-        # If still in_quote (odd number of "), the last " is likely a standalone closing
-        # Revert to original to avoid mangling
-        if in_quote:
-            fixed = c  # don't touch malformed rows
-        if fixed != c:
-            row["content"] = fixed
-            quote_fixes += 1
-    if quote_fixes:
-        log(f"  🔤 Post-processing: converted English quotes to Italian in {quote_fixes} row(s).")
-
-    # ── Post-process: fix "X family" / "famiglia X" format ───────────────
-    # Two separate patterns to avoid IGNORECASE corrupting the uppercase-name check:
-    # Pattern A: hyphenated "Surname" (not common in Italian, but safe to check) — safe, no article ambiguity
-    _fam_hyphen = re.compile(
-        r"\b([A-Z][A-Za-zàèéìòù]+)-[Ff]amiglia\b"
-    )
-    # Pattern B: space-separated single-word surname before "family" or "famiglia"
-    _fam_space = re.compile(
-        r"\b([A-Z][A-Za-zàèéìòù]+)\s+[Ff]amil(?:y|ia|iglia)\b"
-    )
-    _FAM_SKIP = {"La", "Il", "Lo", "Le", "Gli", "The", "Una", "Un", "Uno",
-                 "Sua", "Suo", "Loro", "Nostra", "Nostro"}
-    def _repl_fam(m):
-        name = m.group(1).strip().replace("-", " ")
-        return m.group(0) if name in _FAM_SKIP else f"famiglia {name}"
-    family_fixes = 0
-    for row in rephrased:
-        c = row.get("content", "")
-        c2 = _fam_hyphen.sub(_repl_fam, c)
-        c2 = _fam_space.sub(_repl_fam, c2)
-        if c2 != c:
-            row["content"] = c2
-            family_fixes += 1
-    if family_fixes:
-        log(f"  👪 Post-processing: fixed family name format in {family_fixes} row(s).")
-
-    # ── Post-process: retry empty rows with fallback provider ─────────────────
-    empty_sorts = [r.get("sort") for r in rephrased if not r.get("content", "").strip()]
-    if empty_sorts:
-        log(f"  ⚠️ {len(empty_sorts)} empty row(s) detected, retrying individually: {empty_sorts}")
-        orig_by_sort = {r.get("sort", i): r for i, r in enumerate(rows)}
-        rephrased_by_sort = {r.get("sort"): r for r in rephrased}
-        for sort_n in empty_sorts:
-            orig_row = orig_by_sort.get(sort_n)
-            if not orig_row:
-                continue
-            single_batch = [{
-                "sort": sort_n,
-                "original": orig_row.get("eContent") or orig_row.get("eeContent") or orig_row.get("peContent") or "",
-                "content": (orig_row.get("machineChapterContent")
-                        or orig_row.get("modifChapterContent")
-                        or orig_row.get("chapterConetnt")  # English source only if no Italian MT
-                        or ""),
-                "_quote_role": "both",
-            }]
-            # Single-row retry via Gemini
-            retry_result = None
-            single_prompt = (
-            "Sei un editor italiano esperto. Apporta 2-3 miglioramenti redazionali a questa frase: "
-            "verbi più precisi, connettivi più naturali, apertura di frase variata, o adattamento idiomatico. "
-            "Il risultato deve suonare autentico per un lettore madrelingua.\n"
-            "Rispondi SOLO con un array JSON: "
-            "[{\"sort\": " + str(sort_n) + ", \"content\": \"...\"}]\n"
-            + json.dumps([{"sort": sort_n, "content": single_batch[0]["content"]}], ensure_ascii=False)
-            )
-            # Route through _call_gemini_simple: account-group rotation, RPM/RPD
-            # tracking, 503 retry, and 2048-token budget for thinking tokens.
-            # ── Per-row wall-clock deadline ──────────────────────────────────────────
-            # Max 90s per row: with 20s timeout × 3 groups, a full sweep of all
-            # groups takes ≤ 60s. The extra 30s cushion covers RPM-cooldown waits.
-            # Deadline is enforced inside _call_gemini_simple — it short-circuits
-            # and returns None when wall-clock exceeds the threshold.
-            _row_deadline = time.time() + 90
-            retry_result = _call_gemini_simple(single_prompt, temperature=0.7, max_tokens=2048,
-                                               deadline=_row_deadline)
-            if retry_result and not retry_result[0].get("content", "").strip():
-                retry_result = None
-            # Simple direct approach: just copy original content as fallback
-            if not retry_result or not retry_result[0].get("content", "").strip():
-                fallback_content = orig_row.get("machineChapterContent") or orig_row.get("modifChapterContent") or orig_row.get("chapterConetnt") or ""
-                log(f"    ↩️  Row {sort_n}: using original content as fallback.")
-                rephrased_by_sort[sort_n]["content"] = fallback_content
-            else:
-                log(f"    ✅ Row {sort_n}: retry succeeded.")
-                rephrased_by_sort[sort_n]["content"] = retry_result[0]["content"]
-        rephrased = list(rephrased_by_sort.values())
-
-    # Verify output
-    log("  Verifying output...")
-    issues = verify_output(rows, rephrased)
-
-    # Separate hard failures (abort) from soft warnings (proceed but notify)
-    hard_issues = [i for i in issues if not i.startswith("Warning:")]
-    soft_issues = [i for i in issues if i.startswith("Warning:")]
-
-    if hard_issues:
-        issue_text = "\n".join(f"• {i}" for i in issues)
-        msg = (
-            f"⚠️ <b>CDReader: Review needed</b>\n\n"
-            f"Book: {book_name}\nChapter: {ch_name}\n\n"
-            f"Verification issues:\n{issue_text}\n\n"
-            f"Please review and submit manually."
-        )
-        send_telegram(msg)
-        log(f"Verification failed — {len(hard_issues)} hard issue(s). Stopping for human review.")
-        for i in issues:
-            log(f"  Issue: {i}")
-        return
-
-    if soft_issues:
-        log(f"  ⚠️ Soft warnings (proceeding anyway): {'; '.join(soft_issues)}")
-
-    log(f"  ✅ Verification passed.")
-
-    # Submit
-    if DRY_RUN:
-        log("  [DRY RUN] Skipping submit and finish.")
-        send_telegram(f"[DRY RUN] Rephrasing verified OK for <b>{ch_name}</b>")
-        return
-
-
-    submit_result = submit_chapter(token, proc_id, rephrased, rows)
-    submit_ok = (
-        submit_result.get("status") is True
-        or submit_result.get("message") in ("SaveSuccess", "OperSuccess")
-        or submit_result.get("code") in ("311", "315", 0)
-    )
-
-    # ── Remedy E: Session-expired submit retry (ErrMessage3) ─────────────────
-    # CDReader's editing session opened by StartChapter can expire if processing
-    # takes too long (RPM cooldowns, many retry rows, force-retry timeouts).
-    # ErrMessage3 signals a chapter-state precondition failure — the session lock
-    # is no longer valid.  Fix: re-open the session and retry the submit once.
-    if not submit_ok and "ErrMessage3" in str(submit_result.get("message", "")):
-        log(f"  ⚠️  ErrMessage3 — editing session likely expired. Re-opening session and retrying submit...")
-        try:
-            start_chapter(token, proc_id)
-            time.sleep(2)
-            submit_result = submit_chapter(token, proc_id, rephrased, rows)
-            submit_ok = (
-                submit_result.get("status") is True
-                or submit_result.get("message") in ("SaveSuccess", "OperSuccess")
-                or submit_result.get("code") in ("311", "315", 0)
-            )
-            if submit_ok:
-                log(f"  ✅ Submit succeeded after session refresh.")
-            else:
-                log(f"  ❌ Submit still failing after session refresh: {submit_result}")
-        except Exception as e:
-            log(f"  ❌ Session refresh / resubmit exception: {e}")
-
-    if not submit_ok:
-        msg = (
-            f"❌ <b>CDReader: Submit failed</b>\n"
-            f"Chapter: {ch_name}\nResponse: {submit_result}"
-        )
-        send_telegram(msg)
-        return
-
-    time.sleep(2)
-
-    # Finish
-    finish_result = finish_chapter(token, proc_id)
-
-    # Check for ErrMessage10 — CDReader rejects finish when it detects
-    # the submitted content is too similar to the original machine translation.
-    finish_ok = (
-        finish_result.get("status") is True
-        or finish_result.get("message") in ("SaveSuccess", "OperSuccess", "UpdateSuccess")
-        or finish_result.get("code") in ("311", "315", "200", 0)
-    )
-    if not finish_ok:
-        err_msg = finish_result.get("message", "unknown")
-        if "ErrMessage10" in str(err_msg) or "10" in str(finish_result.get("code", "")):
-            # ── Remedy D: Self-healing ErrMessage10 recovery ───────────────────────────
-            log(f"  ⚠️  ErrMessage10 — attempting automatic recovery...")
-            recovered = _errmessage10_recovery(
-                token=token, chapter_id=proc_id, rows=rows,
-                finish_fn=finish_chapter, submit_fn=submit_chapter,
-            )
-            if not recovered:
-                msg = (
-                    f"⚠️ <b>CDReader: Finish rejected (ErrMessage10)</b>\n\n"
-                    f"📖 {book_name}\n"
-                    f"📄 {ch_name}\n\n"
-                    f"CDReader detected insufficient rephrasing. Automatic recovery also "
-                    f"failed. Please open the chapter manually, make meaningful edits, "
-                    f"and finish it from the CDReader interface."
-                )
-                send_telegram(msg)
-                log(f"  ⚠️  Finish failed and recovery exhausted: {finish_result}")
-                return
-            log(f"  ✅ Recovery succeeded — continuing to task close.")
-        else:
-            msg = (
-                f"⚠️ <b>CDReader: Finish failed</b>\n\n"
-                f"📖 {book_name}\n"
-                f"📄 {ch_name}\n"
-                f"Response: {finish_result}\n\n"
-                f"Please finish manually."
-            )
+        # Fetch rows
+        rows = get_chapter_rows(token, proc_id)
+        if not rows:
+            msg = f"⚠️ <b>CDReader:</b> No rows fetched for {ch_name}. Manual action required."
             send_telegram(msg)
-            log(f"  ⚠️  Finish failed: {finish_result}")
             return
 
-    # Close the Task Center task (equivalent to clicking "verify and close")
-    # In override mode, task_id is None because Task Center was skipped.
-    # Scan for the matching task entry so the Task Center stays clean.
-    if not task_id and proc_id:
-        log(f"  ℹ️  No task_id — scanning Task Center for chapter {proc_id}...")
-        try:
-            _tc_resp = requests.post(
-                f"{BASE_URL}/TaskCenter/AuthorTaskCenterList",
-                headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
-                json={"PageIndex": 1, "PageSize": 20,
-                      "status": "", "optUsers": "",
-                      "taskType": [], "taskTitle": ""},
-                timeout=15,
-            )
-            _tc_resp.raise_for_status()
-            _tc_data = _tc_resp.json().get("data", {})
-            _tc_tasks = (
-                _tc_data.get("dtolist") or _tc_data.get("list") or
-                _tc_data.get("items") or (_tc_data if isinstance(_tc_data, list) else [])
-            )
-            for _tc_t in _tc_tasks:
-                _tc_cid = _tc_t.get("chapterId") or _tc_t.get("objectChapterId")
-                if str(_tc_cid) == str(proc_id):
-                    task_id = _tc_t.get("id")
-                    log(f"  ✅ Found matching Task Center entry: task_id={task_id}")
-                    break
-            if not task_id:
-                log(f"  ℹ️  No Task Center entry found for chapter {proc_id}.")
-        except Exception as e:
-            log(f"  ⚠️  Task Center scan failed: {e}")
+        # ── Already-processed detection ─────────────────────────────────────────
+        # Compare modifChapterContent vs machineChapterContent across rows.
+        # On a fresh chapter, these are identical (CDReader pre-populates modif with MT).
+        # After our pipeline submits, modifChapterContent is updated with our edits.
+        # If a significant fraction already differs, the chapter was already processed
+        # by a previous run — skip to avoid duplicate work and API waste.
+        # OVERRIDE MODE: skip this guard — the whole point of override is to re-process.
+        if status != "override":
+            _edited_count = 0
+            _total_check = 0
+            for r in rows:
+                if r.get("sort", 0) == 0:
+                    continue
+                _mt = (r.get("machineChapterContent") or "").strip()
+                _mod = (r.get("modifChapterContent") or "").strip()
+                if _mt and _mod:
+                    _total_check += 1
+                    if _mt != _mod:
+                        _edited_count += 1
+            _edit_pct = (_edited_count / _total_check * 100) if _total_check > 0 else 0
+            if _total_check > 0 and _edit_pct > 30:
+                log(f"  ⚠️  Already-processed guard: {_edited_count}/{_total_check} rows ({_edit_pct:.0f}%) "
+                    f"already differ from MT — chapter was edited by a previous run. Skipping.")
+                log(f"  Finishing chapter {proc_id} without re-submitting...")
+                # Finish the chapter to clear the Task Center entry
+                try:
+                    finish_chapter(token, proc_id)
+                except Exception:
+                    pass
+                if task_id:
+                    try:
+                        close_task(token, task_id)
+                    except Exception:
+                        pass
+                raise _AlreadyProcessedRetry(f"Chapter {proc_id} already processed")
+        else:
+            log(f"  ℹ️  Override mode — skipping already-processed guard.")
 
-    time.sleep(2)
-    close_task(token, task_id)
+        content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
+        if not content_rows:
+            log(f"  ⚠️  No content rows found — proceeding anyway.")
 
-    # Notify success
-    send_telegram(
-        f"✅ <b>CDReader: Chapter complete!</b>\n\n"
-        f"📖 {book_name}\n"
-        f"📄 {ch_name}\n\n"
-        f"Rephrased, submitted and finished automatically."
-    )
-    log("✅ Pipeline complete.")
+        # Fetch glossary
+        glossary = get_glossary(token, book_id)
+
+        # Rephrase with Gemini
+        log(f"  Rephrasing {len(rows)} rows with Gemini...")
+        rephrased = rephrase_with_gemini(rows, glossary, book_name)
+
+        if not rephrased:
+            msg = (
+                f"❌ <b>CDReader:</b> Gemini rephrasing failed for {ch_name}.\n"
+                f"Manual action required."
+            )
+            send_telegram(msg)
+            return
+
+        # ── Post-process: replace English quotes with Italian quotes ─────────────────
+        # Groq and sometimes Gemini use " instead of „/". Fix deterministically.
+        quote_fixes = 0
+        for row in rephrased:
+            c = row.get("content", "")
+            if '"' not in c:
+                continue
+            # Replace paired English quotes: "text" → „text"
+            # Strategy: first " in a pair → „, second " → "
+            fixed = ""
+            in_quote = False
+            i = 0
+            while i < len(c):
+                ch = c[i]
+                if ch == '"':
+                    if not in_quote:
+                        fixed += '"'  # " opening (straight quote)
+                        in_quote = True
+                    else:
+                        fixed += '"'  # " closing (straight quote)
+                        in_quote = False
+                else:
+                    fixed += ch
+                i += 1
+            # If still in_quote (odd number of "), the last " is likely a standalone closing
+            # Revert to original to avoid mangling
+            if in_quote:
+                fixed = c  # don't touch malformed rows
+            if fixed != c:
+                row["content"] = fixed
+                quote_fixes += 1
+        if quote_fixes:
+            log(f"  🔤 Post-processing: converted English quotes to Italian in {quote_fixes} row(s).")
+
+        # ── Post-process: fix "X family" / "famiglia X" format ───────────────
+        # Two separate patterns to avoid IGNORECASE corrupting the uppercase-name check:
+        # Pattern A: hyphenated "Surname" (not common in Italian, but safe to check) — safe, no article ambiguity
+        _fam_hyphen = re.compile(
+            r"\b([A-Z][A-Za-zàèéìòù]+)-[Ff]amiglia\b"
+        )
+        # Pattern B: space-separated single-word surname before "family" or "famiglia"
+        _fam_space = re.compile(
+            r"\b([A-Z][A-Za-zàèéìòù]+)\s+[Ff]amil(?:y|ia|iglia)\b"
+        )
+        _FAM_SKIP = {"La", "Il", "Lo", "Le", "Gli", "The", "Una", "Un", "Uno",
+                     "Sua", "Suo", "Loro", "Nostra", "Nostro"}
+        def _repl_fam(m):
+            name = m.group(1).strip().replace("-", " ")
+            return m.group(0) if name in _FAM_SKIP else f"famiglia {name}"
+        family_fixes = 0
+        for row in rephrased:
+            c = row.get("content", "")
+            c2 = _fam_hyphen.sub(_repl_fam, c)
+            c2 = _fam_space.sub(_repl_fam, c2)
+            if c2 != c:
+                row["content"] = c2
+                family_fixes += 1
+        if family_fixes:
+            log(f"  👪 Post-processing: fixed family name format in {family_fixes} row(s).")
+
+        # ── Post-process: retry empty rows with fallback provider ─────────────────
+        empty_sorts = [r.get("sort") for r in rephrased if not r.get("content", "").strip()]
+        if empty_sorts:
+            log(f"  ⚠️ {len(empty_sorts)} empty row(s) detected, retrying individually: {empty_sorts}")
+            orig_by_sort = {r.get("sort", i): r for i, r in enumerate(rows)}
+            rephrased_by_sort = {r.get("sort"): r for r in rephrased}
+            for sort_n in empty_sorts:
+                orig_row = orig_by_sort.get(sort_n)
+                if not orig_row:
+                    continue
+                single_batch = [{
+                    "sort": sort_n,
+                    "original": orig_row.get("eContent") or orig_row.get("eeContent") or orig_row.get("peContent") or "",
+                    "content": (orig_row.get("machineChapterContent")
+                            or orig_row.get("modifChapterContent")
+                            or orig_row.get("chapterConetnt")  # English source only if no Italian MT
+                            or ""),
+                    "_quote_role": "both",
+                }]
+                # Single-row retry via Gemini
+                retry_result = None
+                single_prompt = (
+                "Sei un editor italiano esperto. Apporta 2-3 miglioramenti redazionali a questa frase: "
+                "verbi più precisi, connettivi più naturali, apertura di frase variata, o adattamento idiomatico. "
+                "Il risultato deve suonare autentico per un lettore madrelingua.\n"
+                "Rispondi SOLO con un array JSON: "
+                "[{\"sort\": " + str(sort_n) + ", \"content\": \"...\"}]\n"
+                + json.dumps([{"sort": sort_n, "content": single_batch[0]["content"]}], ensure_ascii=False)
+                )
+                # Route through _call_gemini_simple: account-group rotation, RPM/RPD
+                # tracking, 503 retry, and 2048-token budget for thinking tokens.
+                # ── Per-row wall-clock deadline ──────────────────────────────────────────
+                # Max 90s per row: with 20s timeout × 3 groups, a full sweep of all
+                # groups takes ≤ 60s. The extra 30s cushion covers RPM-cooldown waits.
+                # Deadline is enforced inside _call_gemini_simple — it short-circuits
+                # and returns None when wall-clock exceeds the threshold.
+                _row_deadline = time.time() + 90
+                retry_result = _call_gemini_simple(single_prompt, temperature=0.7, max_tokens=2048,
+                                                   deadline=_row_deadline)
+                if retry_result and not retry_result[0].get("content", "").strip():
+                    retry_result = None
+                # Simple direct approach: just copy original content as fallback
+                if not retry_result or not retry_result[0].get("content", "").strip():
+                    fallback_content = orig_row.get("machineChapterContent") or orig_row.get("modifChapterContent") or orig_row.get("chapterConetnt") or ""
+                    log(f"    ↩️  Row {sort_n}: using original content as fallback.")
+                    rephrased_by_sort[sort_n]["content"] = fallback_content
+                else:
+                    log(f"    ✅ Row {sort_n}: retry succeeded.")
+                    rephrased_by_sort[sort_n]["content"] = retry_result[0]["content"]
+            rephrased = list(rephrased_by_sort.values())
+
+        # Verify output
+        log("  Verifying output...")
+        issues = verify_output(rows, rephrased)
+
+        # Separate hard failures (abort) from soft warnings (proceed but notify)
+        hard_issues = [i for i in issues if not i.startswith("Warning:")]
+        soft_issues = [i for i in issues if i.startswith("Warning:")]
+
+        if hard_issues:
+            issue_text = "\n".join(f"• {i}" for i in issues)
+            msg = (
+                f"⚠️ <b>CDReader: Review needed</b>\n\n"
+                f"Book: {book_name}\nChapter: {ch_name}\n\n"
+                f"Verification issues:\n{issue_text}\n\n"
+                f"Please review and submit manually."
+            )
+            send_telegram(msg)
+            log(f"Verification failed — {len(hard_issues)} hard issue(s). Stopping for human review.")
+            for i in issues:
+                log(f"  Issue: {i}")
+            return
+
+        if soft_issues:
+            log(f"  ⚠️ Soft warnings (proceeding anyway): {'; '.join(soft_issues)}")
+
+        log(f"  ✅ Verification passed.")
+
+        # Submit
+        if DRY_RUN:
+            log("  [DRY RUN] Skipping submit and finish.")
+            send_telegram(f"[DRY RUN] Rephrasing verified OK for <b>{ch_name}</b>")
+            return
+
+
+        submit_result = submit_chapter(token, proc_id, rephrased, rows)
+        submit_ok = (
+            submit_result.get("status") is True
+            or submit_result.get("message") in ("SaveSuccess", "OperSuccess")
+            or submit_result.get("code") in ("311", "315", 0)
+        )
+
+        # ── Remedy E: Session-expired submit retry (ErrMessage3) ─────────────────
+        # CDReader's editing session opened by StartChapter can expire if processing
+        # takes too long (RPM cooldowns, many retry rows, force-retry timeouts).
+        # ErrMessage3 signals a chapter-state precondition failure — the session lock
+        # is no longer valid.  Fix: re-open the session and retry the submit once.
+        if not submit_ok and "ErrMessage3" in str(submit_result.get("message", "")):
+            log(f"  ⚠️  ErrMessage3 — editing session likely expired. Re-opening session and retrying submit...")
+            try:
+                start_chapter(token, proc_id)
+                time.sleep(2)
+                submit_result = submit_chapter(token, proc_id, rephrased, rows)
+                submit_ok = (
+                    submit_result.get("status") is True
+                    or submit_result.get("message") in ("SaveSuccess", "OperSuccess")
+                    or submit_result.get("code") in ("311", "315", 0)
+                )
+                if submit_ok:
+                    log(f"  ✅ Submit succeeded after session refresh.")
+                else:
+                    log(f"  ❌ Submit still failing after session refresh: {submit_result}")
+            except Exception as e:
+                log(f"  ❌ Session refresh / resubmit exception: {e}")
+
+        if not submit_ok:
+            msg = (
+                f"❌ <b>CDReader: Submit failed</b>\n"
+                f"Chapter: {ch_name}\nResponse: {submit_result}"
+            )
+            send_telegram(msg)
+            return
+
+        time.sleep(2)
+
+        # Finish
+        finish_result = finish_chapter(token, proc_id)
+
+        # Check for ErrMessage10 — CDReader rejects finish when it detects
+        # the submitted content is too similar to the original machine translation.
+        finish_ok = (
+            finish_result.get("status") is True
+            or finish_result.get("message") in ("SaveSuccess", "OperSuccess", "UpdateSuccess")
+            or finish_result.get("code") in ("311", "315", "200", 0)
+        )
+        if not finish_ok:
+            err_msg = finish_result.get("message", "unknown")
+            if "ErrMessage10" in str(err_msg) or "10" in str(finish_result.get("code", "")):
+                # ── Remedy D: Self-healing ErrMessage10 recovery ───────────────────────────
+                log(f"  ⚠️  ErrMessage10 — attempting automatic recovery...")
+                recovered = _errmessage10_recovery(
+                    token=token, chapter_id=proc_id, rows=rows,
+                    finish_fn=finish_chapter, submit_fn=submit_chapter,
+                )
+                if not recovered:
+                    msg = (
+                        f"⚠️ <b>CDReader: Finish rejected (ErrMessage10)</b>\n\n"
+                        f"📖 {book_name}\n"
+                        f"📄 {ch_name}\n\n"
+                        f"CDReader detected insufficient rephrasing. Automatic recovery also "
+                        f"failed. Please open the chapter manually, make meaningful edits, "
+                        f"and finish it from the CDReader interface."
+                    )
+                    send_telegram(msg)
+                    log(f"  ⚠️  Finish failed and recovery exhausted: {finish_result}")
+                    return
+                log(f"  ✅ Recovery succeeded — continuing to task close.")
+            else:
+                msg = (
+                    f"⚠️ <b>CDReader: Finish failed</b>\n\n"
+                    f"📖 {book_name}\n"
+                    f"📄 {ch_name}\n"
+                    f"Response: {finish_result}\n\n"
+                    f"Please finish manually."
+                )
+                send_telegram(msg)
+                log(f"  ⚠️  Finish failed: {finish_result}")
+                return
+
+        # Close the Task Center task (equivalent to clicking "verify and close")
+        # In override mode, task_id is None because Task Center was skipped.
+        # Scan for the matching task entry so the Task Center stays clean.
+        if not task_id and proc_id:
+            log(f"  ℹ️  No task_id — scanning Task Center for chapter {proc_id}...")
+            try:
+                _tc_resp = _cdreader_post(
+                    f"{BASE_URL}/TaskCenter/AuthorTaskCenterList",
+                    headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
+                    json={"PageIndex": 1, "PageSize": 20,
+                          "status": "", "optUsers": "",
+                          "taskType": [], "taskTitle": ""},
+                )
+                _tc_data = _tc_resp.json().get("data", {})
+                _tc_tasks = (
+                    _tc_data.get("dtolist") or _tc_data.get("list") or
+                    _tc_data.get("items") or (_tc_data if isinstance(_tc_data, list) else [])
+                )
+                for _tc_t in _tc_tasks:
+                    _tc_cid = _tc_t.get("chapterId") or _tc_t.get("objectChapterId")
+                    if str(_tc_cid) == str(proc_id):
+                        task_id = _tc_t.get("id")
+                        log(f"  ✅ Found matching Task Center entry: task_id={task_id}")
+                        break
+                if not task_id:
+                    log(f"  ℹ️  No Task Center entry found for chapter {proc_id}.")
+            except Exception as e:
+                log(f"  ⚠️  Task Center scan failed: {e}")
+
+        time.sleep(2)
+        close_task(token, task_id)
+
+        # Notify success
+        send_telegram(
+            f"✅ <b>CDReader: Chapter complete!</b>\n\n"
+            f"📖 {book_name}\n"
+            f"📄 {ch_name}\n\n"
+            f"Rephrased, submitted and finished automatically."
+        )
+        log("✅ Pipeline complete.")
+
+    except _AlreadyProcessedRetry:
+        raise  # re-raise cleanly — caller handles this sentinel
+    except Exception as e:
+        log(f"❌ Fatal error during chapter processing: {e}")
+        if _chapter_started:
+            send_telegram(
+                f"❌ <b>Pipeline crashed mid-chapter</b>\n\n"
+                f"📖 {book_name}\n"
+                f"📄 {ch_name}\n"
+                f"🔒 Chapter {proc_id} may be locked — please release manually.\n\n"
+                f"Error: {str(e)[:300]}"
+            )
+        raise
 
 
 def run_test():
