@@ -3897,6 +3897,43 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 log(f"  ⚠️  Pre-batch SA: sort={_s} MT trimmed {_mt_w}w→{len(_trimmed.split())}w "
                     f"(EN={_en_w}w ratio={_mt_w/_en_w:.1f}x)")
 
+                # Fix 1b: companion deficiency guard (sort=47/48 class)
+                # When Fix 1 trims sort=N's MT (CDReader donated N's tail into N's MT
+                # from N+1), sort=N+1's MT is left with only the residual fragment —
+                # e.g. "genuinamente confusa." (2w, lowercase) when EN has 8w.
+                # All post-Gemini guards are blind: after the trim, sort=N shows no
+                # inflation signal, so neither MT-based nor EN-anchored bleed fires.
+                # Fix: look ahead at sort=N+1 in gemini_input_data and tag it for
+                # EN-source retry when it shows the companion deficiency signature.
+                # Deficiency signature (either condition):
+                #   (a) MT starts lowercase — indicates attribution fragment, not a sentence
+                #   (b) MT ≤ 4 words AND EN ≥ 4 words — word-count deficit vs EN
+                # False-positive risk is near-zero: Fix 1 already requires a very strong
+                # contamination signal (ratio ≥ 2.5×, MT ≥ 8w). Even if triggered
+                # incorrectly, the EN-source retry path is safe.
+                if _gi + 1 < len(_sorted_gid):
+                    _next_row    = _sorted_gid[_gi + 1]
+                    _next_s      = _next_row.get('sort', 0)
+                    _next_mt     = (_next_row.get('content') or '').strip()
+                    _next_en     = (_next_row.get('original') or '').strip()
+                    _next_mt_w   = len(_next_mt.split())
+                    _next_en_w   = len(_next_en.split())
+                    _next_lc     = bool(_next_mt and _next_mt[0].islower())
+                    _next_deficit = _next_mt_w <= 4 and _next_en_w >= 4
+                    if _next_lc or _next_deficit:
+                        # Prefer pe_content as initial input if it's clean
+                        _next_pe = (_next_row.get('pe_content') or '').strip()
+                        if _next_pe and len(_next_pe.split()) >= 3 and (
+                                _next_pe[0].isupper() or _next_pe[0] in ('"', '\u201c')):
+                            _next_row['content'] = _next_pe
+                            _src_label = 'peContent'
+                        else:
+                            _src_label = 'MT-as-is'
+                        _pre_batch_source_align.add(_next_s)
+                        log(f"  ⚠️  Pre-batch SA Fix1b: sort={_next_s} companion deficit "
+                            f"(MT={_next_mt_w}w lc={_next_lc} EN={_next_en_w}w) "
+                            f"— initial content from {_src_label}, tagged for EN-source retry")
+
         # Fix 2: forward-shift guard (runs on N+1, needs pair)
         if _gi == 0:
             continue
