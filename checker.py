@@ -2105,17 +2105,41 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         _starts_lc = bool(_out_n1 and _out_n1[0].islower())
         _deflated  = (_wc_mt_n1 >= 3 and _wc_out_n1 < _wc_mt_n1 * 0.6)
         _shorter   = (_wc_out_n1 < _wc_mt_n1)     # P3: N+1 lost any words (partial bleed)
-        # P3: condition relaxed — fires when N is inflated AND either:
-        #   (a) N+1 is heavily deflated (<60% MT words) — any bleed regardless of lc
-        #   (b) N+1 starts lowercase AND is shorter than MT — partial bleed (bled words
-        #       didn't fully deplete N+1 but did remove its opening content)
-        if _inflated and (_deflated or (_starts_lc and _shorter)):
+
+        # EN-anchored cross-row bleed (sort=5/6 class):
+        # The MT-based guard is blind when CDReader's MT for row N is ALSO contaminated
+        # (OUT ≈ MT → no inflation signal). The EN source is generated independently from
+        # the Chinese original and is NEVER contaminated by CDReader MT boundary errors.
+        # Thresholds are deliberately conservative:
+        #   2.2× inflation vs EN — Italian is verbose (1.2-1.6× is normal), so only
+        #     extreme cases like 1w→14w (14×) or 2w→10w (5×) fire this branch.
+        #   0.45× deflation vs EN — a row cannot legitimately lose 55%+ of its EN content.
+        # EN_N >= 1: applies to single-word EN rows (most vulnerable to contamination).
+        # EN_N1 >= 4: avoids false positives on genuinely short rows.
+        _en_n   = len((_eng_by_sort.get(_sn,  '') or '').split())
+        _en_n1  = len((_eng_by_sort.get(_sn1, '') or '').split())
+        _en_inflated = (_en_n  >= 1
+                        and _wc_out_n  > _en_n  * 2.2
+                        and (_wc_out_n - _en_n) >= 2)
+        _en_deflated = (_en_n1 >= 4
+                        and _wc_out_n1 < _en_n1 * 0.45)
+
+        # Fire when MT-based condition OR EN-anchored condition holds.
+        # P3: MT condition relaxed — fires when N is inflated AND either:
+        #   (a) N+1 heavily deflated (<60% MT words) — any bleed regardless of lc
+        #   (b) N+1 starts lowercase AND shorter than MT — partial bleed
+        _mt_fires = _inflated and (_deflated or (_starts_lc and _shorter))
+        _en_fires = _en_inflated and _en_deflated
+        if _mt_fires or _en_fires:
             _restore_sn  = _restore_for(_sn)
             _restore_sn1 = _restore_for(_sn1)
             _src_n  = "peContent" if (_pe_by_sort.get(_sn)  or "").strip() else "MT"
             _src_n1 = "peContent" if (_pe_by_sort.get(_sn1) or "").strip() else "MT"
-            log(f"  ⚠️ Cross-row bleed: sort={_sn} ({_wc_mt_n}→{_wc_out_n}w) "
-                f"+ sort={_sn1} lc={_starts_lc} deflated={_deflated} ({_wc_mt_n1}→{_wc_out_n1}w) "
+            _trigger = "EN-anchored" if (_en_fires and not _mt_fires) else "MT-based"
+            log(f"  ⚠️ Cross-row bleed [{_trigger}]: sort={_sn} "
+                f"(MT:{_wc_mt_n}→{_wc_out_n}w EN:{_en_n}→{_wc_out_n}w) "
+                f"+ sort={_sn1} lc={_starts_lc} deflated={_deflated} "
+                f"(MT:{_wc_mt_n1}→{_wc_out_n1}w EN:{_en_n1}→{_wc_out_n1}w) "
                 f"— restoring from {_src_n}/{_src_n1}")
             _row_n['content']  = _restore_sn
             _row_n1['content'] = _restore_sn1
