@@ -320,8 +320,13 @@ The system handles quote characters automatically. You govern the text skeleton 
   When the introduction is a participial phrase or incomplete clause, a comma is correct:
   CORRECT:   dicendo, ... / come per giustificarsi, ... / sottovoce, ...
   INCORRECT: disse, ... / rispose, ... (comma after a complete attribution clause)
-- Attribution following speech: the attribution clause follows the speech text with a comma
-  (... , disse lui.)
+- Attribution following speech uses a COMMA before the close-quote — NEVER a colon:
+  CORRECT:   "Non è granché," rispose. / "Aspetta," disse lui.
+  INCORRECT: "Non è granché: rispose.  ← colon is for introductions only
+  The colon rule applies only when narration INTRODUCES speech that follows on the same row.
+  When the attribution verb comes AFTER the speech (following the close-quote),
+  the speech ends with a comma inside the close-quote, and the attribution is outside:
+  "testo," disse. / "testo," rispose con calma. / "testo," aggiunse.
 - Inner quotes inside already-open speech: use single quotes (' to open and ' to close) or
   \u2018 and \u2019 — NEVER " inside "
 - If the English input has a subject pronoun immediately after a closing quote
@@ -2325,6 +2330,52 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
 
 
 
+
+    # ── Pre-reinject colon-to-comma guard (sort=37 class) ──────────────────────
+    # Root cause: Gemini misapplies the colon-before-speech rule to role=close rows,
+    # writing "speech: rispose." instead of "speech, rispose."
+    # The colon rule is correct for introductions ("narration: speech") but WRONG
+    # when the attribution follows the speech ("speech: attribution").
+    # Effect: P2 (_find_speech_end) requires comma+SV, so it misses colon+SV;
+    # P3 previously missed it too (colon not in lookbehind — now fixed in Layer 3).
+    # This guard converts the colon to a comma BEFORE quote reinject, so P2 fires
+    # correctly and places the close-quote at exactly the right position.
+    #
+    # Condition: role=close or role=both; colon in the last 50% of the text;
+    # SV verb immediately follows the colon (with optional space).
+    # Guard: colon must be after position len/2 — a colon in the first half is
+    # almost certainly a legitimate speech introduction (open/both role structure),
+    # not a misplaced attribution marker.
+    _COLON_ATTR_RE = re.compile(
+        r':\s+(' + _SV + r')',
+        re.IGNORECASE
+    )
+    _colon_attr_fixes = 0
+    for _ca_row in sorted_rows:
+        _ca_sort = _ca_row.get('sort')
+        if _ca_sort == 0:
+            continue
+        _ca_role = _qe_role_by_sort.get(_ca_sort, 'none')
+        if _ca_role not in ('close', 'both', 'middle'):
+            continue
+        _ca_c = _ca_row.get('content', '')
+        if ':' not in _ca_c:
+            continue
+        _ca_m = _COLON_ATTR_RE.search(_ca_c)
+        if not _ca_m:
+            continue
+        # Colon must be in the last 50% of the text (attribution zone)
+        if _ca_m.start() < len(_ca_c) * 0.5:
+            continue
+        # Replace colon with comma
+        _ca_fixed = _ca_c[:_ca_m.start()] + ',' + _ca_c[_ca_m.start() + 1:]
+        _ca_row['content'] = _ca_fixed
+        _colon_attr_fixes += 1
+        log(f"  ⚠️  Pre-reinject colon-to-comma: sort={_ca_sort} role={_ca_role} "
+            f"— {_ca_c[:50]!r} → {_ca_fixed[:50]!r}")
+    if _colon_attr_fixes:
+        log(f"  💬 Pre-reinject colon-to-comma: fixed {_colon_attr_fixes} row(s).")
+
     # ── Quote Reinject: Strip all quotes, place deterministically ──────────
     # Paradigm: do NOT try to fix Gemini's quote placement. Instead, strip ALL
     # outer quote characters from the Italian output and reinject “/” at
@@ -2474,7 +2525,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         # speech ended at that boundary and the SV verb belongs to narration.
         #   ✓ '"Fermati" disse.' → no boundary before disse → fire
         #   ✗ '"Ci sei? Hank scosse la testa disse.' → ? + Hank before disse → defer to P4
-        m2 = re.search(r'(?<=[a-zàèéìòù!?.…])\s+(' + _SV + r')\b', text, re.IGNORECASE)
+        m2 = re.search(r'(?<=[a-zàèéìòù!?.:…])\s+(' + _SV + r')\b', text, re.IGNORECASE)
         if m2:
             _pre_sv3 = text[:m2.start()]
             _bound3 = re.search(r'[?!]\s+([A-Z][a-zA-Zàèéìòù]*)', _pre_sv3)
@@ -2626,8 +2677,15 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
             # Move it before the close quote: speech + , + " + rest_after_comma
             return speech + ',' + _QE_CLOSE + rest[1:]
         else:
-            # No attribution / end of text / terminal punct — just close
-            return speech + _QE_CLOSE + ('' if not rest or rest[0] == ' ' else ' ') + rest.lstrip()
+            # No attribution / end of text / terminal punct — just close.
+            # Colon-strip (Layer 3, sort=37 fix): if rest starts with ':' this means
+            # P3 fired via the extended lookbehind on a colon-preceded SV verb
+            # (e.g. "granché: rispose"). The close-quote is now correctly placed
+            # before the colon; strip the stray colon so the attribution reads cleanly.
+            _rest_stripped = rest.lstrip()
+            if _rest_stripped.startswith(': ') or _rest_stripped.startswith(':'):
+                _rest_stripped = re.sub(r'^:\s*', '', _rest_stripped)
+            return speech + _QE_CLOSE + ('' if not _rest_stripped or _rest_stripped[0] == ' ' else ' ') + _rest_stripped
 
         # _QE_OPEN and _QE_CLOSE are defined at module level (no need to redefine here)
     qe_fixes = 0
