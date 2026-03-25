@@ -2346,6 +2346,8 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
     # Guard: colon must be after position len/2 — a colon in the first half is
     # almost certainly a legitimate speech introduction (open/both role structure),
     # not a misplaced attribution marker.
+    _qe_role_by_sort = {r.get("sort", i): r.get("_quote_role", "none")
+                        for i, r in enumerate(input_data)}
     _COLON_ATTR_RE = re.compile(
         r':\s+(' + _SV + r')',
         re.IGNORECASE
@@ -2382,9 +2384,6 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
     # computed positions based on the English source structure.
     # The English source is the ground truth for WHERE speech starts and ends.
     # The Italian text structure (colons, SV verbs) tells us where to place them.
-
-    _qe_role_by_sort = {r.get("sort", i): r.get("_quote_role", "none")
-                        for i, r in enumerate(input_data)}
 
     def _strip_outer_quotes(text):
         """Remove all outer quote characters. Preserve inner ‚...‘."""
