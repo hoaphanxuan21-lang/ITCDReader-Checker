@@ -2565,6 +2565,26 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         )
         if m_struct_final:
             return m_struct_final.start(), False
+        # ── Priority 3.6: Last ?/! followed by lowercase (sort=2 class) ─────
+        # Handles compound-tense or non-_SV attribution after speech ending in ?/!:
+        #   "Potrei salire, se hai un momento? gli aveva scritto."
+        # P2/P3 miss 'aveva scritto' (compound tense, no single SV verb).
+        # P4 misses because 'gli' is lowercase.
+        # Structural signal: EN confirms attribution follows (en_has_post_close=True)
+        # AND the last ?/! in text is followed by lowercase (the attribution start).
+        # P4 already handles the uppercase-next case; P3.6 fills the lowercase gap.
+        # Guard: punct must be past 20% of text to avoid firing on opening exclamations.
+        #   ✓ "Potrei salire...momento? gli aveva scritto."  → fires (? + lc)
+        #   ✗ "Ha vinto! Ha vinto? È davvero successo!"     → P4 handles (? + UC)
+        #   ✗ "Potrei salire...momento? gli aveva scritto." (no EN attrib) → skip
+        if eng and _en_has_post_close_attribution(eng):
+            _all_excl = list(re.finditer(r'[?!]', text))
+            if _all_excl:
+                _last_excl = _all_excl[-1]
+                if _last_excl.start() > len(text) * 0.2:
+                    _after_excl = text[_last_excl.end():].lstrip()
+                    if _after_excl and _after_excl[0].islower():
+                        return _last_excl.end(), False
         # ── Priority 4: Sentence boundary (.!? + uppercase) ───────────
         m3 = re.search(r'[.!?…]\s+[A-Z]', text)
         if m3:
@@ -2779,8 +2799,30 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 pos, needs_comma = _find_speech_end(stripped, eng)
                 fixed = _italian_close_at(stripped, pos, needs_comma)
             else:
-                # EN closes at end of row (no attribution) → " at end
-                fixed = stripped + _QE_CLOSE
+                # EN closes at end of row (no attribution after its close-quote).
+                # Safety net (sort=45 class): translator may have added an attribution
+                # in the Italian that is absent from the EN (Chinese source split
+                # differently). A blind close-at-end would trap "replicò Ciara" inside
+                # the speech. If the IT text contains an SV verb, run _find_speech_end
+                # as a secondary check before falling back to end-of-text.
+                #   ✓ "È solo un piccolo inconveniente, replicò Ciara." → SV found →
+                #     _find_speech_end fires on ', replicò' (P2) → correct placement
+                #   ✓ "Già." (pure speech, no SV) → no SV → close at end unchanged
+                # Double-lock: only deviates from close-at-end when (a) IT has an SV
+                # verb AND (b) _find_speech_end returns a position < len(stripped),
+                # meaning a genuine boundary was detected. Fallback is unchanged.
+                _it_has_sv = bool(re.search(r'\b(?:' + _SV + r')\b', stripped, re.IGNORECASE))
+                if _it_has_sv:
+                    _pos_sv, _nc_sv = _find_speech_end(stripped, eng)
+                    if _pos_sv < len(stripped):
+                        log(f"  💬 Close SV safety net: sort={sort_n} EN no post-attrib "
+                            f"but IT has SV — close at pos={_pos_sv} "
+                            f"(not end={len(stripped)})")
+                        fixed = _italian_close_at(stripped, _pos_sv, _nc_sv)
+                    else:
+                        fixed = stripped + _QE_CLOSE
+                else:
+                    fixed = stripped + _QE_CLOSE
 
         elif role == "both":
             # Attribution-start guard (same as role=="open" above): skip quote injection
