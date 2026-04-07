@@ -38,7 +38,7 @@ concurrency:
 jobs:
   process-chapter:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 55
 
     steps:
       - name: Checkout repository
@@ -66,7 +66,7 @@ jobs:
           IT_TELEGRAM_BOT_TOKEN: ${{ secrets.IT_TELEGRAM_BOT_TOKEN }}
           IT_TELEGRAM_CHAT_ID:   ${{ secrets.IT_TELEGRAM_CHAT_ID }}
 
-          # ─── Gemini API keys (28 keys, ITGEMINI_ prefix) ──────────────
+          # ─── Gemini API keys (37 keys across 4 accounts, ITGEMINI_ prefix) ──────
           # Account A (keys 1-9): free tier
           ITGEMINI_API_KEY:    ${{ secrets.ITGEMINI_API_KEY }}
           ITGEMINI_API_KEY_2:  ${{ secrets.ITGEMINI_API_KEY_2 }}
@@ -98,6 +98,16 @@ jobs:
           ITGEMINI_API_KEY_26: ${{ secrets.ITGEMINI_API_KEY_26 }}
           ITGEMINI_API_KEY_27: ${{ secrets.ITGEMINI_API_KEY_27 }}
           ITGEMINI_API_KEY_28: ${{ secrets.ITGEMINI_API_KEY_28 }}
+          # Account D (keys 29-37): new GCP project — independent RPM/RPD pool
+          ITGEMINI_API_KEY_29: ${{ secrets.ITGEMINI_API_KEY_29 }}
+          ITGEMINI_API_KEY_30: ${{ secrets.ITGEMINI_API_KEY_30 }}
+          ITGEMINI_API_KEY_31: ${{ secrets.ITGEMINI_API_KEY_31 }}
+          ITGEMINI_API_KEY_32: ${{ secrets.ITGEMINI_API_KEY_32 }}
+          ITGEMINI_API_KEY_33: ${{ secrets.ITGEMINI_API_KEY_33 }}
+          ITGEMINI_API_KEY_34: ${{ secrets.ITGEMINI_API_KEY_34 }}
+          ITGEMINI_API_KEY_35: ${{ secrets.ITGEMINI_API_KEY_35 }}
+          ITGEMINI_API_KEY_36: ${{ secrets.ITGEMINI_API_KEY_36 }}
+          ITGEMINI_API_KEY_37: ${{ secrets.ITGEMINI_API_KEY_37 }}
 
           # ─── Mode switches ─────────────────────────────────────────────
           TEST_MODE:            ${{ github.event.inputs.test_mode || 'false' }}
