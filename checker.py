@@ -1730,7 +1730,7 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
 
 
 # ─── Remedy D: ErrMessage10 self-healing recovery ─────────────────────────────
-_MAX_RETRIES       = 35  # max rows retried per chapter (moved to module level, checker-27)
+_MAX_RETRIES       = 45  # max rows retried per chapter (raised from 35 — C3 fix)
 _RECOVERY_MAX_ROWS = 15
 _RECOVERY_SIM_THRESHOLD = 0.80  # wider net than SIM_THRESHOLD — Italian CDReader is stricter
 
@@ -3748,8 +3748,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
         # RPD-exhausted keys (daily quota) are marked permanently and never retried.
         # Max full RPM-reset rotations before giving up: MAX_RETRIES_429
+        #
+        # C1 fix: _transient_503_count is separate from full_rotations.
+        # 503 Service Unavailable is a transient infrastructure error — it must NOT
+        # consume RPM-rotation slots. A batch can survive up to 8 consecutive 503s
+        # with exponential backoff (15s, 30s, 60s, 60s...) before giving up.
         resp = None  # safe before first request; allows Retry-After header read in wait block
         full_rotations = 0
+        _transient_503_count = 0  # C1: counts 503-only failures, never increments full_rotations
+        _MAX_503_ATTEMPTS = 8    # C1: up to 8 attempts ~7 min patience for an outage to clear
         while full_rotations < MAX_RETRIES_429:
             try:
                 # Fail fast if every key has hit its daily quota
@@ -3862,14 +3869,39 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 log(f"   Raw response (first 500 chars): {text[:500]}")
                 log(f"  Retrying in 15s...")
                 time.sleep(15)
-                full_rotations += 1  # prevent infinite loop on persistent malformed JSON
+                full_rotations += 1  # JSON errors burn a rotation slot (not a 503)
                 continue
             except Exception as e:
-                log(f"❌ Gemini error on batch {batch_num}: {e}")
-                log(f"  Retrying in 15s...")
-                time.sleep(15)
-                full_rotations += 1
-                continue
+                # C1: detect 503 Service Unavailable specifically.
+                # 503 is a transient Gemini infrastructure error — it must NOT burn
+                # a full_rotations slot (those are reserved for RPM-exhaustion cycles).
+                # Use a separate counter with exponential backoff: 15s, 30s, 60s cap.
+                _is_503 = (
+                    '503' in str(e)
+                    or 'Service Unavailable' in str(e)
+                    or (hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 503)
+                )
+                if _is_503:
+                    _transient_503_count += 1
+                    if _transient_503_count >= _MAX_503_ATTEMPTS:
+                        log(f"❌ Batch {batch_num}: 503 persisted for ~7 min "
+                            f"({_transient_503_count} attempts) — falling back to MT.")
+                        return None
+                    _503_wait = min(15 * (2 ** min(_transient_503_count - 1, 2)), 60)
+                    log(f"❌ Gemini 503 on batch {batch_num} "
+                        f"(attempt {_transient_503_count}/{_MAX_503_ATTEMPTS}) "
+                        f"— waiting {_503_wait}s...")
+                    time.sleep(_503_wait)
+                    # Do NOT increment full_rotations — 503 is not an RPM event
+                    continue
+                else:
+                    # Non-503 exceptions (network error, unexpected HTTP, etc.)
+                    # do consume a rotation slot to prevent infinite loops.
+                    log(f"❌ Gemini error on batch {batch_num}: {e}")
+                    log(f"  Retrying in 15s...")
+                    time.sleep(15)
+                    full_rotations += 1
+                    continue
         return None  # all rotations exhausted
 
     # Sort=0 is always the chapter title row (e.g. "Capitolo 60 Comparsa E Rubare I Riflettori!").
@@ -4010,6 +4042,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     all_rephrased = []
     _force_retry_sorts: dict = {}    # Remedy A: sorts from trunc-guard for unconditional retry
     _register_block = ''  # built from processed rows; injected into batches 2+
+    _prev_batch_503_fail = False    # C2: True when the previous batch failed due to 503 outage
     key_count = len(GEMINI_KEYS)
     _ag_info = ", ".join(f"{_ACCOUNT_LABELS[i]}:{len(g)}" for i, g in enumerate(_ACCOUNT_GROUPS) if g)
     log(f"  Using {key_count} Gemini key(s) across {len(_ACCOUNT_GROUPS)} accounts ({_ag_info}) with group rotation.")
@@ -4025,6 +4058,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             # quality that can be partially recovered.
             log(f"  ⚠️  Batch {i} failed — falling back to MT for {len(batch)} rows.")
             result = [{"sort": r.get("sort"), "content": r.get("content", "")} for r in batch]
+            _prev_batch_503_fail = True   # C2: flag for extra recovery wait before next batch
         # ── Guard 1: Missing-sort reconciliation ────────────────────────────────
         # Gemini occasionally returns fewer rows than were sent (output truncation,
         # dropped rows under context pressure). Any missing sort number means that
@@ -4227,6 +4261,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if _register_block:
                 mapped = sum(1 for ln in _register_block.splitlines() if "register" in ln.lower())
                 log(f"  Register block updated after batch {i}: {mapped} character(s) mapped.")
+            # C2: if previous batch 503-failed, add an extra recovery wait before the next
+            # batch so the Gemini infrastructure has time to recover from the outage.
+            # Without this, the next batch immediately fires into the same outage window.
+            if _prev_batch_503_fail:
+                _c2_extra = 60
+                log(f"  ⏳ C2 recovery wait: previous batch failed on 503 — waiting {_c2_extra}s "
+                    f"for Gemini infrastructure to recover before batch {i + 1}...")
+                time.sleep(_c2_extra)
+                _prev_batch_503_fail = False
             time.sleep(_INTER_BATCH_SLEEP)
 
     log(f"  Total rows rephrased: {len(all_rephrased)}")
