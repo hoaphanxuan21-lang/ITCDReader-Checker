@@ -81,6 +81,18 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("ITGEMINI_API_KEY_26", ""),
     os.environ.get("ITGEMINI_API_KEY_27", ""),
     os.environ.get("ITGEMINI_API_KEY_28", ""),
+    # Account D: ITGEMINI_API_KEY_29 through ITGEMINI_API_KEY_37 (positions 28-36, 9 keys)
+    # New GCP project — independent RPM/RPD pool, replaces 403-dead Account C keys.
+    # Add keys to GitHub Actions secrets as ITGEMINI_API_KEY_29 .. _37.
+    os.environ.get("ITGEMINI_API_KEY_29", ""),
+    os.environ.get("ITGEMINI_API_KEY_30", ""),
+    os.environ.get("ITGEMINI_API_KEY_31", ""),
+    os.environ.get("ITGEMINI_API_KEY_32", ""),
+    os.environ.get("ITGEMINI_API_KEY_33", ""),
+    os.environ.get("ITGEMINI_API_KEY_34", ""),
+    os.environ.get("ITGEMINI_API_KEY_35", ""),
+    os.environ.get("ITGEMINI_API_KEY_36", ""),
+    os.environ.get("ITGEMINI_API_KEY_37", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -111,20 +123,21 @@ _PAID_KEY_MIN_INTERVAL: float = 0.4   # seconds between calls on the paid key
 _PAID_KEY: str = os.environ.get("ITGEMINI_API_KEY_28", "").strip()
 
 # ─── Account-group-aware key management ───────────────────────────────────────
-# Keys are spread across 3 distinct Google accounts (= 3 independent RPM/RPD pools):
+# Keys are spread across 4 distinct Google accounts (= 4 independent RPM/RPD pools):
 # Account A: ITGEMINI_API_KEY through ITGEMINI_API_KEY_9  (positions 0-8,  9 keys)
 # Account B: ITGEMINI_API_KEY_10 through ITGEMINI_API_KEY_18 (positions 9-17, 9 keys)
-# Account C: ITGEMINI_API_KEY_19 through ITGEMINI_API_KEY_28 (positions 18-27, includes paid)
+# Account C: ITGEMINI_API_KEY_19 through ITGEMINI_API_KEY_28 (positions 18-27, 10 keys, includes paid)
+# Account D: ITGEMINI_API_KEY_29 through ITGEMINI_API_KEY_37 (positions 28-36, 9 keys, new GCP project)
 # When ONE key in an account returns 429-RPM, ALL keys in that account are blocked
 # (rate limits are per Google Cloud project). But OTHER accounts are still available.
 _ACCOUNT_GROUPS: list = []  # list of list[str], populated by _init_account_groups()
-_ACCOUNT_LABELS = ['A', 'B', 'C']
+_ACCOUNT_LABELS = ['A', 'B', 'C', 'D']
 
 def _init_account_groups():
     """Build account group lists from _GEMINI_KEYS_RAW. Called once at pipeline start.
     Separated from module level to avoid side effects at import time (testability)."""
     _ACCOUNT_GROUPS.clear()
-    for _ag_start, _ag_end in [(0, 9), (9, 18), (18, 28)]:
+    for _ag_start, _ag_end in [(0, 9), (9, 18), (18, 28), (28, 37)]:
         _ag_keys = [k for k in _GEMINI_KEYS_RAW[_ag_start:_ag_end] if k.strip()]
         _ACCOUNT_GROUPS.append(_ag_keys)
     _ag_counts = [len(g) for g in _ACCOUNT_GROUPS]
@@ -3756,7 +3769,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         resp = None  # safe before first request; allows Retry-After header read in wait block
         full_rotations = 0
         _transient_503_count = 0  # C1: counts 503-only failures, never increments full_rotations
-        _MAX_503_ATTEMPTS = 8    # C1: up to 8 attempts ~7 min patience for an outage to clear
+        _MAX_503_ATTEMPTS = 2    # C1: 2 attempts max (15s + 20s = 35s total) — fall to MT fast,
+                                 # let the retry loop handle recovery once the outage clears
         while full_rotations < MAX_RETRIES_429:
             try:
                 # Fail fast if every key has hit its daily quota
@@ -3887,7 +3901,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                         log(f"❌ Batch {batch_num}: 503 persisted for ~7 min "
                             f"({_transient_503_count} attempts) — falling back to MT.")
                         return None
-                    _503_wait = min(15 * (2 ** min(_transient_503_count - 1, 2)), 60)
+                    _503_wait = 15 if _transient_503_count == 1 else 20  # 15s first, 20s second
                     log(f"❌ Gemini 503 on batch {batch_num} "
                         f"(attempt {_transient_503_count}/{_MAX_503_ATTEMPTS}) "
                         f"— waiting {_503_wait}s...")
