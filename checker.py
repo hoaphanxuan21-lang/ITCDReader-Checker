@@ -249,6 +249,13 @@ _BATCH_SIZE: int = 40                  # rows per Gemini batch call
 _BATCH_MAX_RETRIES_429: int = 3        # max full RPM-reset rotations per batch before giving up
 _MAX_503_ATTEMPTS: int = 3             # Phase 2: 503 retry attempts (15s + 20s + 30s = 65s total)
 
+# Gateway-level 503 fast-path: when generativelanguage.googleapis.com is saturated,
+# skip primary model + Phase 1 (same gateway) and go straight to Vertex AI.
+_consecutive_vertex_only: int = 0      # rows where only Vertex AI succeeded
+_VERTEX_FAST_PATH_THRESHOLD: int = 3   # skip primary after this many consecutive Vertex-only successes
+_vx_cached_token: str = ""             # cached Vertex AI bearer token
+_vx_cached_token_expiry: float = 0.0   # epoch time when cached token expires
+
 
 
 def _next_gemini_key(prefer_group=None):
@@ -1176,6 +1183,83 @@ def _deterministic_change(text):
     return text
 
 
+def _call_vertex_ai(prompt, temperature=0.5, max_tokens=2048, call_timeout=25):
+    """Standalone Vertex AI call — used by Phase 3 and fast-path.
+
+    Returns parsed JSON list or None. Uses cached bearer token when valid
+    (avoids re-authenticating on every call — saves ~0.3-0.5s per row).
+    """
+    global _vx_cached_token, _vx_cached_token_expiry
+    if not VERTEX_SA_JSON or not VERTEX_PROJECT:
+        return None
+    try:
+        import json as _vx_json
+        now = time.time()
+        # Reuse cached token if still valid (tokens last 3600s, we refresh at 3500s)
+        if _vx_cached_token and now < _vx_cached_token_expiry:
+            _vx_token = _vx_cached_token
+        else:
+            from google.oauth2 import service_account as _vx_sa
+            from google.auth.transport.requests import Request as _VxRequest
+            _sa_info = _vx_json.loads(VERTEX_SA_JSON)
+            _vx_creds = _vx_sa.Credentials.from_service_account_info(
+                _sa_info,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            _vx_creds.refresh(_VxRequest())
+            _vx_token = _vx_creds.token
+            _vx_cached_token = _vx_token
+            _vx_cached_token_expiry = now + 3500  # refresh 100s before expiry
+
+        _vx_url = (
+            f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
+            f"/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}"
+            f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
+        )
+        _vx_resp = requests.post(
+            _vx_url,
+            headers={
+                "Authorization": f"Bearer {_vx_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": max_tokens,
+                },
+            },
+            timeout=call_timeout,
+        )
+        if _vx_resp.status_code != 200:
+            log(f"    ⚠️  Phase 3 Vertex AI: HTTP {_vx_resp.status_code} — "
+                f"{_vx_resp.text[:120]}")
+            return None
+        _vx_body = _vx_resp.json()
+        _vx_cands = _vx_body.get("candidates", [])
+        if not _vx_cands:
+            return None
+        _vx_text = (
+            _vx_cands[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        )
+        if not _vx_text:
+            return None
+        if _vx_text.startswith("```"):
+            _vx_text = re.sub(r"^```[^\n]*\n", "", _vx_text)
+            _vx_text = _vx_text.rsplit("```", 1)[0].strip()
+        _vx_text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', _vx_text)
+        _vx_parsed = _vx_json.loads(_vx_text)
+        if isinstance(_vx_parsed, list) and _vx_parsed:
+            return _vx_parsed
+    except ImportError:
+        log("    ⚠️  Phase 3 Vertex AI: google-auth not installed")
+    except json.JSONDecodeError:
+        log("    ⚠️  Phase 3 Vertex AI: unparseable JSON response")
+    except Exception as _vx_err:
+        log(f"    ⚠️  Phase 3 Vertex AI error: {_vx_err}")
+    return None
+
+
 def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None, call_timeout=20):
     """Account-group-aware Gemini call for single-row retries.
     
@@ -1204,11 +1288,28 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
       5. PER-ROW DEADLINE: Enforced internally — if deadline is set, each group iteration
          and the second-pass wait check it before proceeding.
     """
-    global _retry_scan_offset
+    global _retry_scan_offset, _consecutive_vertex_only
 
     keys_all = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys]
     if not keys_all:
         return None  # All keys daily-dead
+
+    # ── Gateway fast-path: skip primary + Phase 1 when gateway is confirmed down ──
+    # After _VERTEX_FAST_PATH_THRESHOLD consecutive rows where only Vertex AI succeeded,
+    # the gateway (generativelanguage.googleapis.com) is saturated. Both gemini-2.5-flash
+    # and gemini-2.0-flash share this gateway, so trying them wastes ~13-15s per row.
+    # Go straight to Vertex AI (separate infrastructure: aiplatform.googleapis.com).
+    if _consecutive_vertex_only >= _VERTEX_FAST_PATH_THRESHOLD and VERTEX_SA_JSON and VERTEX_PROJECT:
+        log(f"    ⚡ Gateway fast-path: skipping primary+Phase 1 "
+            f"({_consecutive_vertex_only} consecutive Vertex-only)")
+        result = _call_vertex_ai(prompt, temperature, max_tokens, call_timeout=25)
+        if result is not None:
+            _consecutive_vertex_only += 1
+            log("    ✅ Phase 3 Vertex AI fallback succeeded")
+            return result
+        # Vertex also failed — gateway may have recovered, fall through to primary
+        log("    ⚠️  Vertex AI failed on fast-path — falling back to primary model")
+        _consecutive_vertex_only = 0
 
     _paid_key = _PAID_KEY if _PAID_KEY else None
 
@@ -1292,6 +1393,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
     # the same account first. Within each group, pick the first cooled key.
     _rpm_blocked_groups = set()  # groups where 429-RPM was seen this call
     _soft_none_groups = 0        # Fix D: groups that returned non-429 None (soft-503 / empty candidates)
+    _5xx_exception_groups = set()  # groups where 503/5xx exceptions were raised (gateway-level signal)
     n_groups = len(_ACCOUNT_GROUPS)
     start_group = _retry_scan_offset % n_groups
     _retry_scan_offset += 1
@@ -1324,6 +1426,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                     _group_got_result = True  # RPM response counts as "contacted" — not a soft-None
                     break  # skip rest of this group, try next account
                 if result is not None:
+                    _consecutive_vertex_only = 0  # primary succeeded — reset gateway fast-path
                     return result
                 # Empty/None result but no 429 — content-blocked or empty candidates.
                 # No quota consumed — try next key in same group before giving up.
@@ -1334,6 +1437,10 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                 log(f"    ⚠️ Account {_ACCOUNT_LABELS[gi]} key error: {e}")
                 # On exception, don't burn remaining keys in this group — move to next account
                 _group_got_result = True  # exception counts as "contacted" — not a soft-None
+                # Track 503/5xx for gateway-level detection
+                _e_str = str(e)
+                if any(c in _e_str for c in ('500', '502', '503', '504', 'timed out')):
+                    _5xx_exception_groups.add(gi)
                 break
         # After trying all cooled keys in this group with no success:
         # If the group was neither RPM-blocked nor raised an exception, all its cooled
@@ -1353,6 +1460,29 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         log(f"    ℹ️ Fix D: all {_soft_none_groups} non-RPM-blocked group(s) returned soft-None "
             f"— waiting {_soft_backoff}s before second pass (possible Gemini high-load).")
         time.sleep(_soft_backoff)
+
+    # ── Gateway-level 503 detection ──────────────────────────────────────────
+    # If ALL active groups returned 5xx/timeout exceptions (not RPM, not RPD —
+    # infrastructure errors), the gateway is saturated. The second pass and
+    # Phase 1 (gemini-2.0-flash) share the same gateway and will also 503.
+    # Skip them entirely and go straight to Vertex AI (separate infrastructure).
+    _active_group_count = sum(
+        1 for gi in range(n_groups)
+        if any(k in keys_all and k not in _rpd_exhausted_keys and k not in _403_excluded_keys
+               for k in _ACCOUNT_GROUPS[gi])
+    )
+    if (len(_5xx_exception_groups) > 0
+            and len(_5xx_exception_groups) >= _active_group_count
+            and VERTEX_SA_JSON and VERTEX_PROJECT):
+        log(f"    ⚡ Gateway-level 503: all {len(_5xx_exception_groups)} active group(s) "
+            f"returned 5xx — skipping second pass + Phase 1, going to Vertex AI")
+        result = _call_vertex_ai(prompt, temperature, max_tokens, call_timeout=25)
+        if result is not None:
+            _consecutive_vertex_only += 1
+            log("    ✅ Phase 3 Vertex AI fallback succeeded")
+            return result
+        # Vertex also failed — fall through to second pass as normal
+        log("    ⚠️  Vertex AI also failed — continuing with second pass")
 
     # ── Second pass: wait for soonest key across non-blocked groups ────────
     if deadline and time.time() > deadline:
@@ -1405,6 +1535,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                         _second_pass_attempts += 1
                         continue
                     if result is not None:
+                        _consecutive_vertex_only = 0  # primary succeeded — reset gateway fast-path
                         return result
                     # Soft-None — try the next cooled key
                     _second_pass_attempts += 1
@@ -1467,6 +1598,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             if isinstance(fb_parsed, list) and fb_parsed:
                 log(f"    ✅ Phase 1 fallback: {GEMINI_FALLBACK_MODEL} succeeded "
                     f"(Account {_ACCOUNT_LABELS[gi]})")
+                _consecutive_vertex_only = 0  # Phase 1 succeeded — reset gateway fast-path
                 return fb_parsed
         except json.JSONDecodeError:
             continue  # unparseable — try next group
@@ -1476,78 +1608,16 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         log(f"    ⚠️  Phase 1 fallback: {GEMINI_FALLBACK_MODEL} also failed on all groups")
 
     # ── Phase 3: Vertex AI fallback ────────────────────────────────────────────────────────
-    # Fires when both gemini-2.5-flash and gemini-2.0-flash have failed on
-    # all account groups — confirming gateway-level saturation on
-    # generativelanguage.googleapis.com. Vertex AI (aiplatform.googleapis.com)
-    # is a separate infrastructure tier unaffected by developer API outages.
-    # Silently skipped if VERTEX_SA_JSON or VERTEX_PROJECT secrets are not set.
+    # Fires when both gemini-2.5-flash and gemini-2.0-flash have failed on all groups.
+    # Uses extracted _call_vertex_ai() helper (with credential caching).
     if VERTEX_SA_JSON and VERTEX_PROJECT:
         if deadline and time.time() > deadline:
             return None
-        try:
-            # ─ Authenticate: exchange service account JSON for OAuth2 bearer token ─
-            import json as _vx_json
-            from google.oauth2 import service_account as _vx_sa
-            from google.auth.transport.requests import Request as _VxRequest
-            _sa_info = _vx_json.loads(VERTEX_SA_JSON)
-            _vx_creds = _vx_sa.Credentials.from_service_account_info(
-                _sa_info,
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
-            _vx_creds.refresh(_VxRequest())
-            _vx_token = _vx_creds.token
-
-            # ─ Call Vertex AI endpoint ─────────────────────────────────────────────────
-            _vx_url = (
-                f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
-                f"/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}"
-                f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
-            )
-            _vx_resp = requests.post(
-                _vx_url,
-                headers={
-                    "Authorization": f"Bearer {_vx_token}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "temperature": temperature,
-                        "maxOutputTokens": max_tokens,
-                    },
-                },
-                timeout=call_timeout,
-            )
-            if _vx_resp.status_code != 200:
-                log(f"    ⚠️  Phase 3 Vertex AI: HTTP {_vx_resp.status_code} — "
-                    f"{_vx_resp.text[:120]}")
-            else:
-                _vx_body = _vx_resp.json()
-                _vx_cands = _vx_body.get("candidates", [])
-                if _vx_cands:
-                    _vx_text = (
-                        _vx_cands[0]
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
-                        .strip()
-                    )
-                    if _vx_text:
-                        if _vx_text.startswith("```"):
-                            _vx_text = re.sub(r"^```[^\n]*\n", "", _vx_text)
-                            _vx_text = _vx_text.rsplit("```", 1)[0].strip()
-                        _vx_text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', _vx_text)  # trailing ]] fix
-                        _vx_parsed = json.loads(_vx_text)
-                        if isinstance(_vx_parsed, list) and _vx_parsed:
-                            log("    ✅ Phase 3 Vertex AI fallback succeeded")
-                            return _vx_parsed
-        except ImportError:
-            log("    ⚠️  Phase 3 Vertex AI: google-auth not installed "
-                "(add google-auth to pip install in main.yml)")
-        except json.JSONDecodeError:
-            log("    ⚠️  Phase 3 Vertex AI: unparseable JSON response")
-        except Exception as _vx_err:
-            log(f"    ⚠️  Phase 3 Vertex AI error: {_vx_err}")
+        result = _call_vertex_ai(prompt, temperature, max_tokens, call_timeout=25)
+        if result is not None:
+            _consecutive_vertex_only += 1
+            log("    ✅ Phase 3 Vertex AI fallback succeeded")
+            return result
 
     return None
 
