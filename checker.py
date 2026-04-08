@@ -973,17 +973,29 @@ _SYNONYMS = [
     (r'\bsi alzò\b', 'si levò'),
     (r'\bfissò\b', 'scrutò'),
     (r'\bcapì\b', 'comprese'),
-    (r'\bdecise\b', 'stabiliì'),
+    (r'\bdecise\b', 'stabilì'),
     (r'\brimase\b', 'restò'),
-    (r'\bcomincì\b', 'iniziò'),
+    (r'\bcominciò\b', 'iniziò'),
     (r'\bdavanti\b', 'dinanzi'),
     (r'\btra sé\b', 'dentro di sé'),
     (r'\bsi voltò\b', 'si girò'),
     (r'\bpercepì\b', 'avvertì'),
     (r'\baccettò\b', 'accolse'),
-    (r'\bchius\u00e9\b', 'serrò'),
-    (r'\bscrutò\b', 'esaminò'),
+    (r'\bchiuse\b', 'serrò'),
+    (r'\bscrutò\b', 'squadrò'),
     (r'\bcontinuò\b', 'proseguì'),
+    # Option C: imperfetto, infinitive, and other forms — covers 'no fallback possible'
+    # on short narrative rows with modal/imperfetto verbs not previously in table.
+    (r'\bsembrava\b', 'pareva'),
+    (r'\bgravava\b', 'incombeva'),
+    (r'\bin fondo\b', 'in fin dei conti'),
+    (r'\btroppo\b', 'eccessivamente'),
+    (r'\bcercava\b', 'tentava'),
+    (r'\bguardava\b', 'osservava'),
+    (r'\bstava\b', 'si trovava'),
+    (r'\baspettava\b', 'attendeva'),
+    (r'\brestava\b', 'rimaneva'),
+    (r'\bcamminava\b', 'procedeva'),
 ]
 
 
@@ -1420,17 +1432,27 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
 
     _api_retries_ok = 0
     _fallback_applied = 0
-    # Fix 1: adaptive mid-retry cooldown.
-    # When Fix A skips the pre-retry cooldown (all batches 503-failed, no RPM consumed),
-    # the retry loop starts with fully-fresh keys. Rapid consecutive successes exhaust
-    # all four accounts' RPM windows within ~15-20 rows, causing an all-groups-RPM-blocked
-    # cascade mid-loop. Fix: count actual API calls made in the retry loop; when the count
-    # reaches _RETRY_RPM_THRESHOLD, insert a 65s cooldown and reset the counter.
-    # Threshold = 36: 4 accounts × 9 free-tier keys × 10 RPM = headroom for ~36 calls
-    # before any account group is guaranteed to be RPM-saturated.
-    # Only fires when needed (high-outage runs with many rows); silent on clean runs.
-    _RETRY_RPM_THRESHOLD = 36
-    _retry_api_call_count = 0  # counts attempted Gemini calls (success OR fail) in retry loop
+    # Option A: time-based adaptive mid-retry cooldown (replaces count-based Fix 1).
+    #
+    # Why time-based is better than count-based:
+    # Fix 1 used a call-count threshold (36 calls). Under clean conditions this works:
+    # rows succeed quickly, 36 calls are reached, cooldown fires before RPM exhaustion.
+    # Under mixed 503/success conditions (partial outage), each failed row costs 20-50s
+    # of wait time inside _call_gemini_simple. Only 10-15 calls are made in 5 minutes,
+    # never reaching 36 — yet the 5-6 successful calls still saturate RPM because their
+    # 60s windows expire and re-fill while the loop waits on 503s. Count-blind = cascade.
+    #
+    # Time-based fix: cooldown fires when BOTH conditions are met:
+    #   1. >= 55s have elapsed since last cooldown (just under the 60s RPM window)
+    #   2. >= 3 successful API calls have been made since last cooldown
+    # Condition 2 prevents firing during a pure 503 stretch where no RPM was consumed.
+    # On clean fast runs, condition 1 fires first (same or better than count-based).
+    # On slow mixed-outage runs, condition 1 fires after the first 503 wait, preventing
+    # the cascade before it starts.
+    _RETRY_COOLDOWN_INTERVAL = 55    # seconds between adaptive cooldowns (< 60s RPM window)
+    _RETRY_COOLDOWN_MIN_CALLS = 3    # min successful API calls before cooldown can fire
+    _retry_last_cooldown_time = time.time()  # timestamp of last cooldown (init = loop start)
+    _retry_successful_calls = 0      # successful API calls since last cooldown
 
     for sort_n, (current_out, ref_text, reason) in retry_candidates.items():
         # Skip API call if keys are dead (Fix C)
@@ -1548,18 +1570,21 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
                 temp = 0.5
         # end if not _is_bleed_row
 
-        # Fix 1: adaptive mid-retry cooldown — fire before this call if threshold reached.
-        # This runs whether or not keys are alive (gate is inside the if).
-        if _keys_alive and _retry_api_call_count > 0 and _retry_api_call_count % _RETRY_RPM_THRESHOLD == 0:
-            log(f"  ⏳ Fix 1: {_retry_api_call_count} API calls made in retry loop "
-                f"— inserting {_PRE_RETRY_COOLDOWN}s adaptive RPM cooldown to prevent all-groups exhaustion...")
+        # Option A: time-based adaptive cooldown — fire before this call if conditions met.
+        _elapsed_since_cooldown = time.time() - _retry_last_cooldown_time
+        if (_keys_alive
+                and _elapsed_since_cooldown >= _RETRY_COOLDOWN_INTERVAL
+                and _retry_successful_calls >= _RETRY_COOLDOWN_MIN_CALLS):
+            log(f"  ⏳ Option A: {_elapsed_since_cooldown:.0f}s elapsed + {_retry_successful_calls} "
+                f"successful call(s) — inserting {_PRE_RETRY_COOLDOWN}s adaptive RPM cooldown...")
             _exhausted_keys.intersection_update(_rpd_exhausted_keys)
             time.sleep(_PRE_RETRY_COOLDOWN)
-            log(f"  ✅ Fix 1: adaptive cooldown complete — resuming retry loop.")
+            _retry_last_cooldown_time = time.time()
+            _retry_successful_calls = 0
+            log(f"  ✅ Option A: adaptive cooldown complete — resuming retry loop.")
         _use_4096 = "truncated" in reason or _is_bleed_row
         result = _call_gemini_simple(prompt, temperature=temp,
                                      max_tokens=4096 if _use_4096 else 2048)
-        _retry_api_call_count += 1  # Fix 1: count every attempted API call
         if result and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
             # EN-primary re-bleed guard: if Gemini still returned inflated content
@@ -1596,17 +1621,20 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
                         log(f"    ✅ sort={sort_n}: retry OK but still {new_sim:.0%} — det. boost → {boosted_sim:.0%}: {boosted[:60]!r}")
                         rephrased_by_sort[sort_n]["content"] = boosted
                         _api_retries_ok += 1
+                        _retry_successful_calls += 1  # Option A: count for time-based cooldown
                     else:
                         # Det. change also failed — accept the API result anyway (still changed)
                         log(f"    ✅ sort={sort_n}: retry OK (sim={new_sim:.0%}, boost unavailable): {new_content[:60]!r}")
                         rephrased_by_sort[sort_n]["content"] = new_content
                         _api_retries_ok += 1
+                        _retry_successful_calls += 1  # Option A
                 else:
                     log(f"    ✅ sort={sort_n}: retry OK" +
                         (f" (sim={new_sim:.0%})" if new_sim else "") +
                         f": {new_content[:60]!r}")
                     rephrased_by_sort[sort_n]["content"] = new_content
                     _api_retries_ok += 1
+                    _retry_successful_calls += 1  # Option A: count for time-based cooldown
             else:
                 # API returned same text — apply deterministic fallback
                 fallback = _deterministic_change(current_out)
