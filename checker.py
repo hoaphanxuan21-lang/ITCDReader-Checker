@@ -211,6 +211,8 @@ def _init_account_groups():
     _ag_info = ", ".join(f"Account {_ACCOUNT_LABELS[i]}: {_ag_counts[i]} keys"
                          for i in range(len(_ACCOUNT_GROUPS)))
     log(f"Account groups initialized: {_ag_info}")
+    log(f"Vertex AI fallback: {'configured' if VERTEX_SA_JSON and VERTEX_PROJECT else 'NOT configured (secrets missing)'}"
+        f"{f' — project={VERTEX_PROJECT}' if VERTEX_PROJECT else ''}")
 
 # Rotating counter: determines which account group gets tried first for each batch/retry.
 # Incremented after each batch call to spread RPD load evenly across accounts.
@@ -1067,6 +1069,20 @@ _SYNONYMS = [
     (r'\baspettava\b', 'attendeva'),
     (r'\brestava\b', 'rimaneva'),
     (r'\bcamminava\b', 'procedeva'),
+    # Chapter 324 diagnostic (2026-04-08): 36 "no fallback possible" rows.
+    # These pairs cover the most frequent unmatched words from that run.
+    (r'\bascoltava\b', 'prestava attenzione'),
+    (r'\battentamente\b', 'con cura'),
+    (r'\bscosse\b', 'scroll\u00f2'),    # scrollò: passato remoto of scrollare
+    (r'\btremavano\b', 'vibravano'),
+    (r'\blenti\b', 'rallentati'),
+    (r'\bevidente\b', 'palese'),
+    (r'\bostinazione\b', 'caparbiet\u00e0'),
+    (r'\bperse\b', 'sprec\u00f2'),      # sprecò: "wasted" — safe for "perse tempo"
+    (r'\bnot\u00f2\b', 'si accorse'),    # notò→si accorse: neutral observation
+    (r'\bscena\b', 'spettacolo'),
+    (r'\btirarlo\b', 'trascinarlo'),
+    (r'\bsilenziosamente\b', 'in silenzio'),
 ]
 
 
