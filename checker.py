@@ -126,6 +126,52 @@ _last_rpm_cooldown_time: float = 0.0  # Fix E: timestamp of last completed RPM c
 # Prevents hammering recently-used keys before their token-bucket window has refilled.
 _key_last_used: dict = {}
 
+# A3: Per-key call timestamp ring buffer — stores list of recent call timestamps per key.
+# Enables RPM calculation: how many calls to a key in the last 60s, and when the next
+# slot frees. Ring buffer keeps last 15 entries (sufficient for 10 RPM window).
+_key_call_history: dict = {}   # api_key → list[float]
+_KEY_HISTORY_SIZE = 15         # max timestamps to keep per key
+
+def _record_call(api_key):
+    """Record a call timestamp for a key (updates both _key_last_used and _key_call_history)."""
+    now = time.time()
+    _key_last_used[api_key] = now
+    hist = _key_call_history.get(api_key)
+    if hist is None:
+        _key_call_history[api_key] = [now]
+    else:
+        hist.append(now)
+        if len(hist) > _KEY_HISTORY_SIZE:
+            del hist[:-_KEY_HISTORY_SIZE]
+
+def _compute_rpm_wait(account_groups, excluded_keys, window_s=60, rpm_limit=10):
+    """Return minimum seconds to wait before any account group has a free RPM slot.
+
+    For each group: count calls in the last window_s across all live keys.
+    If under rpm_limit → 0 wait. If at/over → wait until the oldest call in
+    the window falls out. Returns the minimum wait across all groups (0 if any
+    group has headroom).
+    """
+    now = time.time()
+    best_wait = float('inf')
+    for group in account_groups:
+        live_keys = [k for k in group if k not in excluded_keys]
+        if not live_keys:
+            continue
+        # Collect all call timestamps for this group in the last window_s
+        group_calls = []
+        for k in live_keys:
+            hist = _key_call_history.get(k, [])
+            group_calls.extend(t for t in hist if now - t < window_s)
+        if len(group_calls) < rpm_limit:
+            return 0.0  # at least one group has headroom — no wait needed
+        # Group is at capacity — wait until oldest call falls out of window
+        group_calls.sort()
+        wait = (group_calls[0] + window_s) - now
+        if wait < best_wait:
+            best_wait = wait
+    return max(0.0, best_wait) if best_wait != float('inf') else 0.0
+
 # Rotating scan start offset for _call_gemini_simple (Option 2).
 # Incremented after each call to distribute load evenly across keys instead of
 # always starting from key 1 and concentrating heat at the top of the rotation.
@@ -175,7 +221,7 @@ _batch_account_offset: int = 0
 # (Not module-level persistent — RPM blocks are transient, ~60s.)
 
 def _key_account_group(api_key):
-    """Return the account group index (0-2) for a given API key, or -1 if unknown."""
+    """Return the account group index (0-3) for a given API key, or -1 if unknown."""
     for gi, group in enumerate(_ACCOUNT_GROUPS):
         if api_key in group:
             return gi
@@ -195,6 +241,11 @@ _ENG_ATTRIBUTION_MAX_WORDS: int = 12   # BGS guard: max English words for a sent
 # Timing constants
 _INTER_BATCH_SLEEP: float = 5.0        # seconds between Gemini batch calls
 _PRE_RETRY_COOLDOWN: int  = 65         # seconds to wait before retry loop when ≥2 batches completed
+_RETRY_COOLDOWN_INTERVAL: int = 55     # ISSUE 8: seconds between adaptive cooldowns (< 60s RPM window)
+_RETRY_COOLDOWN_MIN_CALLS: int = 3     # ISSUE 8: min successful API calls before cooldown can fire
+_BATCH_SIZE: int = 40                  # rows per Gemini batch call
+_BATCH_MAX_RETRIES_429: int = 3        # max full RPM-reset rotations per batch before giving up
+_MAX_503_ATTEMPTS: int = 3             # Phase 2: 503 retry attempts (15s + 20s + 30s = 65s total)
 
 
 
@@ -918,8 +969,8 @@ _SYNONYMS = [
     (r'\bancora\b', 'tuttora'),
     # già → ormai REMOVED: opposite temporal implication in many contexts
     (r'\bora\b', 'adesso'),
-    (r'\bsempre\b', 'tuttora'),  # tuttora: literary "still/always"
-    (r'\bcos\u00ec\b', 'talmente'),
+    (r'\bsempre\b', 'costantemente'),  # costantemente: safe near-synonym for "always"
+    (r'\bcos\u00ec\b', 'in tal modo'),  # in tal modo: safe for 'thus/so'
     (r'\bdi nuovo\b', 'nuovamente'),
     (r'\bforse\b', 'probabilmente'),
     (r'\bprima\b', 'dapprima'),
@@ -938,17 +989,17 @@ _SYNONYMS = [
     (r'\bgrande\b', 'imponente'),
     (r'\bpiccolo\b', 'esiguo'),
     (r'\bvecchio\b', 'anziano'),
-    (r'\bbreve\b', 'conciso'),
+    (r'\bbreve\b', 'rapido'),  # rapido: safe across temporal/spatial contexts
     (r'\bfelice\b', 'contento'),
     (r'\bforte\b', 'robusto'),
     (r'\bdebole\b', 'fragile'),
     (r'\bchiaro\b', 'limpido'),
     (r'\bscuro\b', 'cupo'),
     (r'\bfreddo\b', 'gelido'),
-    (r'\bcaldo\b', 'tiepido'),
+    (r'\bcaldo\b', 'rovente'),  # rovente: intensified "hot" — safe in fiction
     (r'\bfacile\b', 'semplice'),
     (r'\bprofondo\b', 'intenso'),
-    (r'\bgiovane\b', 'giovanile'),
+    (r'\bgiovane\b', 'in giovane età'),  # periphrasis — avoids giovanile (different meaning)
     # Common verbs (passato remoto — narrative tense)
     (r'\bdisse\b', 'afferm\u00f2'),
     (r'\bchiese\b', 'domand\u00f2'),
@@ -1002,7 +1053,7 @@ _SYNONYMS = [
     (r'\bpercepì\b', 'avvertì'),
     (r'\baccettò\b', 'accolse'),
     (r'\bchiuse\b', 'serrò'),
-    (r'\bscrutò\b', 'squadrò'),
+    (r'\bscrutò\b', 'esaminò'),  # esaminò: breaks chain fissò→scrutò→squadrò
     (r'\bcontinuò\b', 'proseguì'),
     # Option C: imperfetto, infinitive, and other forms — covers 'no fallback possible'
     # on short narrative rows with modal/imperfetto verbs not previously in table.
@@ -1031,12 +1082,13 @@ def _find_synonym_pair(text):
 
     Returns None if no synonym matches outside quotes (very short rows, pure dialogue).
     """
-    # Build a set of character index ranges that are inside „..." quotes
+    # Build a set of character index ranges that are inside "..." or "..." quotes
     _quote_ranges = []
     _i = 0
     while _i < len(text):
-        if text[_i] == '"':  # " straight quote (open)
-            _j = text.find('"', _i + 1)  # matching closing "
+        if text[_i] in ('\u201c', '"'):  # U+201C curly open or straight "
+            _close = '\u201d' if text[_i] == '\u201c' else '"'
+            _j = text.find(_close, _i + 1)
             if _j == -1:
                 _j = len(text) - 1  # fallback: end of text
             if _j != -1:
@@ -1074,12 +1126,13 @@ def _deterministic_change(text):
     Strategy: try synonym substitutions in priority order; apply the FIRST match only.
     Skips matches inside quoted speech (consistent with _find_synonym_pair).
     """
-    # Build quote-protected ranges (same logic as _find_synonym_pair — Italian “...”)
+    # Build quote-protected ranges (Italian “...” or straight "...")
     _quote_ranges = []
     _i = 0
     while _i < len(text):
-        if text[_i] == '"':  # " straight quote (open)
-            _j = text.find('"', _i + 1)  # matching closing "
+        if text[_i] in ('\u201c', '"'):  # U+201C curly open or straight "
+            _close = '\u201d' if text[_i] == '\u201c' else '"'
+            _j = text.find(_close, _i + 1)
             if _j == -1:
                 _j = len(text) - 1  # fallback: end of text
             if _j != -1:
@@ -1121,7 +1174,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                       to avoid premature timeouts on complex prompts.
     
     Key design (2026-03-17, timeout + deadline update):
-      1. ACCOUNT-GROUP ROTATION: Keys are in 3 Google accounts with independent RPM/RPD.
+      1. ACCOUNT-GROUP ROTATION: Keys are in 4 Google accounts with independent RPM/RPD.
          Try one key from each account group. When a group returns 429-RPM, skip only
          that group — other accounts are unaffected.
       2. FAST TIMEOUT: 20s per call (was 45s). Single-row prompts are small; a 20s
@@ -1157,7 +1210,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
 
         Timeout: call_timeout (default 20s for retry, 45s for recovery prompts).
         """
-        _key_last_used[api_key] = time.time()
+        _record_call(api_key)
         try:
             resp = requests.post(
                 f"{GEMINI_URL}?key={api_key}",
@@ -1210,6 +1263,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             return None, False, False
         if text.startswith("```"):
             text = re.sub(r"^```[^\n]*\n", "", text); text = text.rsplit("```", 1)[0].strip()
+        text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', text)  # trailing ]] fix
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
@@ -1321,15 +1375,22 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         # entire second pass. Try up to 3 cooled keys before giving up.
         _second_pass_attempts = 0
         for k in available_keys:
+            if _key_account_group(k) in _rpm_blocked_groups:
+                continue  # ISSUE 10: skip keys from groups already known to be RPM-blocked
             if _is_cooled(k):
                 try:
                     result, is_rpd, is_rpm = _one_call(k)
                     if is_rpd:
                         _rpd_exhausted_keys.add(k)
                         continue
-                    if not is_rpm and result is not None:
+                    if is_rpm:
+                        # ISSUE 10 fix: propagate RPM block so we skip this group's remaining keys
+                        _rpm_blocked_groups.add(_key_account_group(k))
+                        _second_pass_attempts += 1
+                        continue
+                    if result is not None:
                         return result
-                    # Soft-None or RPM on this key — try the next cooled key
+                    # Soft-None — try the next cooled key
                     _second_pass_attempts += 1
                 except Exception:
                     _second_pass_attempts += 1
@@ -1357,7 +1418,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         fb_key = fb_group_keys[0]  # one key per group — fast sweep
         _fallback_attempted = True
         try:
-            _key_last_used[fb_key] = time.time()
+            _record_call(fb_key)
             resp = requests.post(
                 f"{GEMINI_FALLBACK_URL}?key={fb_key}",
                 json={
@@ -1385,6 +1446,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             if fb_text.startswith("```"):
                 fb_text = re.sub(r"^```[^\n]*\n", "", fb_text)
                 fb_text = fb_text.rsplit("```", 1)[0].strip()
+            fb_text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', fb_text)  # trailing ]] fix
             fb_parsed = json.loads(fb_text)
             if isinstance(fb_parsed, list) and fb_parsed:
                 log(f"    ✅ Phase 1 fallback: {GEMINI_FALLBACK_MODEL} succeeded "
@@ -1458,6 +1520,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                         if _vx_text.startswith("```"):
                             _vx_text = re.sub(r"^```[^\n]*\n", "", _vx_text)
                             _vx_text = _vx_text.rsplit("```", 1)[0].strip()
+                        _vx_text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', _vx_text)  # trailing ]] fix
                         _vx_parsed = json.loads(_vx_text)
                         if isinstance(_vx_parsed, list) and _vx_parsed:
                             log("    ✅ Phase 3 Vertex AI fallback succeeded")
@@ -1473,7 +1536,8 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
     return None
 
 def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
-                   glossary_terms=None, register_block=None, max_retries=None):
+                   glossary_terms=None, register_block=None, max_retries=None,
+                   pre_retry_cooldown_end: float = 0.0):
     """Identify and retry rows that are verbatim, too similar to MT, or truncated.
 
     bleed_sorts: dict of sort → reason ('bleed'|'bgs'|'truncated') from _force_retry_sorts.
@@ -1603,9 +1667,12 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
     # On clean fast runs, condition 1 fires first (same or better than count-based).
     # On slow mixed-outage runs, condition 1 fires after the first 503 wait, preventing
     # the cascade before it starts.
-    _RETRY_COOLDOWN_INTERVAL = 55    # seconds between adaptive cooldowns (< 60s RPM window)
-    _RETRY_COOLDOWN_MIN_CALLS = 3    # min successful API calls before cooldown can fire
-    _retry_last_cooldown_time = time.time()  # timestamp of last cooldown (init = loop start)
+    # A2: Initialize Option A clock from pre-retry cooldown end if it ran recently,
+    # so we don't double-count the 65s that already elapsed before the retry loop.
+    _retry_last_cooldown_time = (
+        pre_retry_cooldown_end if pre_retry_cooldown_end > 0
+        else time.time()
+    )
     _retry_successful_calls = 0      # successful API calls since last cooldown
 
     for sort_n, (current_out, ref_text, reason) in retry_candidates.items():
@@ -1724,18 +1791,26 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
                 temp = 0.5
         # end if not _is_bleed_row
 
-        # Option A: time-based adaptive cooldown — fire before this call if conditions met.
+        # Option A + A3: time-based adaptive cooldown with dynamic RPM wait.
         _elapsed_since_cooldown = time.time() - _retry_last_cooldown_time
         if (_keys_alive
                 and _elapsed_since_cooldown >= _RETRY_COOLDOWN_INTERVAL
                 and _retry_successful_calls >= _RETRY_COOLDOWN_MIN_CALLS):
-            log(f"  ⏳ Option A: {_elapsed_since_cooldown:.0f}s elapsed + {_retry_successful_calls} "
-                f"successful call(s) — inserting {_PRE_RETRY_COOLDOWN}s adaptive RPM cooldown...")
             _exhausted_keys.intersection_update(_rpd_exhausted_keys)
-            time.sleep(_PRE_RETRY_COOLDOWN)
+            _dynamic_wait = _compute_rpm_wait(
+                _ACCOUNT_GROUPS,
+                _rpd_exhausted_keys | _403_excluded_keys | _exhausted_keys
+            )
+            if _dynamic_wait > 1.0:
+                log(f"  ⏳ Option A: {_elapsed_since_cooldown:.0f}s elapsed + "
+                    f"{_retry_successful_calls} call(s) — dynamic RPM wait "
+                    f"{_dynamic_wait:.0f}s (vs fixed {_PRE_RETRY_COOLDOWN}s)")
+                time.sleep(_dynamic_wait)
+            else:
+                log(f"  ✅ Option A: RPM check — all groups have headroom, no wait needed "
+                    f"({_elapsed_since_cooldown:.0f}s / {_retry_successful_calls} calls)")
             _retry_last_cooldown_time = time.time()
             _retry_successful_calls = 0
-            log(f"  ✅ Option A: adaptive cooldown complete — resuming retry loop.")
         _use_4096 = "truncated" in reason or _is_bleed_row
         result = _call_gemini_simple(prompt, temperature=temp,
                                      max_tokens=4096 if _use_4096 else 2048)
@@ -3528,7 +3603,7 @@ def _build_register_block(processed_rows):
     _attrib_re = re.compile(
         r'[\u201c"](.*?)[\u201d"]\s*[,.]?\s*'
         r'(?:disse|chiese|sussurr\u00f2|rispose|esclam\u00f2|mormor\u00f2|replic\u00f2|parl\u00f2|'
-        r'mormor\u00f2|sibil\u00f2|balbett\u00f2|grid\u00f2|url\u00f2|'
+        r'sibil\u00f2|balbett\u00f2|grid\u00f2|url\u00f2|'
         r'bisbigli\u00f2|ringhi\u00f2|prosegu\u00ec|dichiar\u00f2|spieg\u00f2|'
         r'sorrise|sogghign\u00f2|annuì|sospir\u00f2|sbuff\u00f2|brontol\u00f2|borbott\u00f2)\s+'
         r'([A-Z\u00c0\u00c8\u00c9\u00cc\u00d2\u00d9][a-z\u00e0\u00e8\u00e9\u00ec\u00f2\u00f9]{2,})\b'
@@ -3789,10 +3864,6 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         fields = ["chapterConetnt","eContent","eeContent","modifChapterContent","machineChapterContent","languageContent","peContent","referenceContent"]
         log("  Field presence: " + ", ".join(f"{f}={bool(r0.get(f))}" for f in fields))
 
-    BATCH_SIZE = 40
-    MAX_RETRIES = 3
-    MAX_RETRIES_429 = 3    # If 429 persists beyond 3 tries, RPD is likely exhausted — fail fast
-
     def _fix_json_strings(s):
         """Fix literal newlines/tabs inside JSON string values (Pass 1).
 
@@ -3989,7 +4060,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
         # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
         # RPD-exhausted keys (daily quota) are marked permanently and never retried.
-        # Max full RPM-reset rotations before giving up: MAX_RETRIES_429
+        # Max full RPM-reset rotations before giving up: _BATCH_MAX_RETRIES_429
         #
         # C1 fix: _transient_503_count is separate from full_rotations.
         # 503 Service Unavailable is a transient infrastructure error — it must NOT
@@ -3998,12 +4069,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         resp = None  # safe before first request; allows Retry-After header read in wait block
         full_rotations = 0
         _transient_503_count = 0  # C1: counts 503-only failures, never increments full_rotations
-        _MAX_503_ATTEMPTS = 3    # Phase 2: 3 attempts max (15s + 20s + 30s = 65s total).
-                                 # One extra attempt recovers batches during partial outages
-                                 # where a third try often succeeds, reducing MT-fallback rows
-                                 # that would otherwise flood the unified retry queue.
+        # _MAX_503_ATTEMPTS: promoted to module level (line 249)
         _batch_start_time = time.time()  # for accurate elapsed-time reporting in 503 fallback message
-        while full_rotations < MAX_RETRIES_429:
+        while full_rotations < _BATCH_MAX_RETRIES_429:
             try:
                 # Fail fast if every key has hit its daily quota
                 if _all_keys_rpd_dead():
@@ -4013,8 +4081,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 if not api_key:
                     # All remaining (non-RPD) keys are RPM-exhausted — wait for reset
                     full_rotations += 1
-                    if full_rotations >= MAX_RETRIES_429:
-                        log(f"❌ All Gemini keys RPM-exhausted after {MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
+                    if full_rotations >= _BATCH_MAX_RETRIES_429:
+                        log(f"❌ All Gemini keys RPM-exhausted after {_BATCH_MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
                         return None
                     # Honour Retry-After header if present (more precise than flat 60s)
                     retry_after = None
@@ -4025,7 +4093,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                         pass
                     wait = retry_after if retry_after and retry_after > 0 else 60
                     rpm_exhausted_count = len([k for k in GEMINI_KEYS if k in _exhausted_keys and k not in _rpd_exhausted_keys])
-                    log(f"  ⚠️ {rpm_exhausted_count} key(s) RPM-limited. Waiting {wait}s for reset (rotation {full_rotations}/{MAX_RETRIES_429})...")
+                    log(f"  ⚠️ {rpm_exhausted_count} key(s) RPM-limited. Waiting {wait}s for reset (rotation {full_rotations}/{_BATCH_MAX_RETRIES_429})...")
                     _exhausted_keys.intersection_update(_rpd_exhausted_keys)  # clear RPM state, preserve RPD
                     time.sleep(wait)
                     continue
@@ -4282,9 +4350,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         log(f"  💬 Pre-batch: {_fwd_fixed} forward-shift row(s) tagged for EN-source retry.")
 
     # Split into batches and call Gemini for each
-    batches = [gemini_input_data[i:i+BATCH_SIZE] for i in range(0, len(gemini_input_data), BATCH_SIZE)]
+    batches = [gemini_input_data[i:i+_BATCH_SIZE] for i in range(0, len(gemini_input_data), _BATCH_SIZE)]
     total_batches = len(batches)
-    log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
+    log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{_BATCH_SIZE}...")
 
     all_rephrased = []
     _force_retry_sorts: dict = {}    # Remedy A: sorts from trunc-guard for unconditional retry
@@ -4590,6 +4658,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Fix A: skip the cooldown entirely when no batch succeeded (all fell back to MT).
     # If no Gemini call was made in the batch phase, no RPM quota was consumed and
     # the cooldown is a pure waste of time (65s during an already slow outage run).
+    _pre_retry_end = 0.0   # A2: timestamp of pre-retry cooldown completion
     if total_batches >= 2 and not _all_keys_rpd_dead() and _any_batch_success:
         _cooldown = _PRE_RETRY_COOLDOWN
         log(f"  ⏳ Pre-retry RPM cooldown: {total_batches} batch(es) completed — waiting {_cooldown}s for RPM windows to expire...")
@@ -4597,6 +4666,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _exhausted_keys.intersection_update(_rpd_exhausted_keys)
         log(f"  ✅ RPM cooldown complete — retry loop starting with fresh key pool.")
         _last_rpm_cooldown_time = time.time()
+        _pre_retry_end = time.time()   # A2: capture end timestamp
     elif total_batches >= 2 and not _any_batch_success:
         log(f"  ⏭  Fix A: no batch succeeded (all 503-fallback) — skipping RPM cooldown (no quota consumed).")
 
@@ -4621,7 +4691,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                                     bleed_sorts=_force_retry_sorts,
                                     glossary_terms=glossary_terms,
                                     register_block=_register_block,
-                                    max_retries=_dynamic_max_retries)
+                                    max_retries=_dynamic_max_retries,
+                                    pre_retry_cooldown_end=_pre_retry_end)
 
     # Re-run post-processing on retry output to ensure retried rows get
     # the same treatment (Pass QE, comma rules, glossary enforcement, etc.)
@@ -5480,7 +5551,7 @@ def run_test():
     TEST_MODE: exercises the full rephrase pipeline on synthetic rows.
     No CDReader login, no submit, no finish. Safe to run anytime.
     Tests: Gemini key rotation, prompt quality, all post-processors, verification.
-    Uses up to 6 Gemini API keys with automatic rotation.
+    Uses up to 37 Gemini API keys with automatic rotation.
     """
     _init_account_groups()
     log("=" * 60)
@@ -5492,7 +5563,7 @@ def run_test():
         f"key {i+1}: {'✅' if k else '⚠️ not set'}"
         for i, k in enumerate(
             os.environ.get(f"ITGEMINI_API_KEY{'_' + str(i+1) if i > 0 else ''}", "")
-            for i in range(28)
+            for i in range(37)
         )
     )
     log(f"Gemini key status: {key_statuses}")
