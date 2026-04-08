@@ -3845,6 +3845,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _transient_503_count = 0  # C1: counts 503-only failures, never increments full_rotations
         _MAX_503_ATTEMPTS = 2    # C1: 2 attempts max (15s + 20s = 35s total) — fall to MT fast,
                                  # let the retry loop handle recovery once the outage clears
+        _batch_start_time = time.time()  # for accurate elapsed-time reporting in 503 fallback message
         while full_rotations < MAX_RETRIES_429:
             try:
                 # Fail fast if every key has hit its daily quota
@@ -3972,7 +3973,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 if _is_503:
                     _transient_503_count += 1
                     if _transient_503_count >= _MAX_503_ATTEMPTS:
-                        log(f"❌ Batch {batch_num}: 503 persisted for ~7 min "
+                        _elapsed_503 = time.time() - _batch_start_time
+                        log(f"❌ Batch {batch_num}: 503 persisted for {_elapsed_503:.0f}s "
                             f"({_transient_503_count} attempts) — falling back to MT.")
                         return None
                     _503_wait = 15 if _transient_503_count == 1 else 20  # 15s first, 20s second
@@ -4375,16 +4377,18 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             # batch so the Gemini infrastructure has time to recover from the outage.
             # Without this, the next batch immediately fires into the same outage window.
             #
-            # Fix 2: suppress C2 when _consecutive_503_fails >= 2 (sustained outage confirmed).
-            # A single-batch blip warrants a recovery pause; a streak of 2+ means the outage
-            # is sustained and 60s won't help — the next batch will fail regardless. Skip the
-            # wait so Fix C (early-exit) or the final batch reaches unified retry sooner.
+            # Fix 2: suppress C2 when _consecutive_503_fails >= 1.
+            # By the time _prev_batch_503_fail is True, _call_gemini has already given Gemini
+            # two 503 attempts with 15s+20s backoff (35s total). Any additional C2 wait is
+            # redundant: transient blips recover within the batch's own retry window; sustained
+            # outages last far longer than 60s and 60s won't help. Fire on >= 1 so 2-batch
+            # chapters also benefit (>= 2 was never reached in the 2-batch case).
             if _prev_batch_503_fail:
-                if _consecutive_503_fails >= 2:
+                if _consecutive_503_fails >= 1:
                     log(f"  ⏭️  Fix 2: sustained 503 outage ({_consecutive_503_fails} consecutive) "
                         f"— skipping C2 wait before batch {i + 1} (outage confirmed, wait won't help).")
                 else:
-                    _c2_extra = 60
+                    _c2_extra = 10  # reduced from 60s: batch already spent 35s on 503 retries
                     log(f"  ⏳ C2 recovery wait: previous batch failed on 503 — waiting {_c2_extra}s "
                         f"for Gemini infrastructure to recover before batch {i + 1}...")
                     time.sleep(_c2_extra)
