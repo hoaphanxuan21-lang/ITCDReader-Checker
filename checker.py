@@ -1447,6 +1447,17 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
 
     _api_retries_ok = 0
     _fallback_applied = 0
+    # Fix 1: adaptive mid-retry cooldown.
+    # When Fix A skips the pre-retry cooldown (all batches 503-failed, no RPM consumed),
+    # the retry loop starts with fully-fresh keys. Rapid consecutive successes exhaust
+    # all four accounts' RPM windows within ~15-20 rows, causing an all-groups-RPM-blocked
+    # cascade mid-loop. Fix: count actual API calls made in the retry loop; when the count
+    # reaches _RETRY_RPM_THRESHOLD, insert a 65s cooldown and reset the counter.
+    # Threshold = 36: 4 accounts × 9 free-tier keys × 10 RPM = headroom for ~36 calls
+    # before any account group is guaranteed to be RPM-saturated.
+    # Only fires when needed (high-outage runs with many rows); silent on clean runs.
+    _RETRY_RPM_THRESHOLD = 36
+    _retry_api_call_count = 0  # counts attempted Gemini calls (success OR fail) in retry loop
 
     for sort_n, (current_out, ref_text, reason) in retry_candidates.items():
         # Skip API call if keys are dead (Fix C)
@@ -1564,9 +1575,18 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
                 temp = 0.5
         # end if not _is_bleed_row
 
+        # Fix 1: adaptive mid-retry cooldown — fire before this call if threshold reached.
+        # This runs whether or not keys are alive (gate is inside the if).
+        if _keys_alive and _retry_api_call_count > 0 and _retry_api_call_count % _RETRY_RPM_THRESHOLD == 0:
+            log(f"  ⏳ Fix 1: {_retry_api_call_count} API calls made in retry loop "
+                f"— inserting {_PRE_RETRY_COOLDOWN}s adaptive RPM cooldown to prevent all-groups exhaustion...")
+            _exhausted_keys.intersection_update(_rpd_exhausted_keys)
+            time.sleep(_PRE_RETRY_COOLDOWN)
+            log(f"  ✅ Fix 1: adaptive cooldown complete — resuming retry loop.")
         _use_4096 = "truncated" in reason or _is_bleed_row
         result = _call_gemini_simple(prompt, temperature=temp,
                                      max_tokens=4096 if _use_4096 else 2048)
+        _retry_api_call_count += 1  # Fix 1: count every attempted API call
         if result and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
             # EN-primary re-bleed guard: if Gemini still returned inflated content
@@ -4354,11 +4374,20 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             # C2: if previous batch 503-failed, add an extra recovery wait before the next
             # batch so the Gemini infrastructure has time to recover from the outage.
             # Without this, the next batch immediately fires into the same outage window.
+            #
+            # Fix 2: suppress C2 when _consecutive_503_fails >= 2 (sustained outage confirmed).
+            # A single-batch blip warrants a recovery pause; a streak of 2+ means the outage
+            # is sustained and 60s won't help — the next batch will fail regardless. Skip the
+            # wait so Fix C (early-exit) or the final batch reaches unified retry sooner.
             if _prev_batch_503_fail:
-                _c2_extra = 60
-                log(f"  ⏳ C2 recovery wait: previous batch failed on 503 — waiting {_c2_extra}s "
-                    f"for Gemini infrastructure to recover before batch {i + 1}...")
-                time.sleep(_c2_extra)
+                if _consecutive_503_fails >= 2:
+                    log(f"  ⏭️  Fix 2: sustained 503 outage ({_consecutive_503_fails} consecutive) "
+                        f"— skipping C2 wait before batch {i + 1} (outage confirmed, wait won't help).")
+                else:
+                    _c2_extra = 60
+                    log(f"  ⏳ C2 recovery wait: previous batch failed on 503 — waiting {_c2_extra}s "
+                        f"for Gemini infrastructure to recover before batch {i + 1}...")
+                    time.sleep(_c2_extra)
                 _prev_batch_503_fail = False
             time.sleep(_INTER_BATCH_SLEEP)
 
