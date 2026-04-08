@@ -37,6 +37,13 @@ ClaimedChapter = namedtuple('ClaimedChapter', [
 BASE_URL    = "https://translatorserverwebapi-it.cdreader.com/api"
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL  = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# Phase 1: fallback model for _call_gemini_simple when all groups 503-fail.
+# gemini-2.0-flash runs on separate serving infrastructure from 2.5-flash —
+# outages on the 2.5-flash tier do not co-degrade 2.0-flash. Quality for
+# short single-row Italian rephrasing prompts is fully adequate. Uses the
+# same API keys (separate per-model RPM quota — does not consume 2.5-flash quota).
+GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
+GEMINI_FALLBACK_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_FALLBACK_MODEL}:generateContent"
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("IT_TELEGRAM_BOT_TOKEN", "")
@@ -1315,6 +1322,67 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                     _second_pass_attempts += 1
                 if _second_pass_attempts >= 3:
                     break  # give up after 3 attempts in the second pass
+
+    # ── Phase 1: gemini-2.0-flash fallback pass ───────────────────────────
+    # Fires only when ALL groups failed on gemini-2.5-flash (first+second pass
+    # returned nothing). Uses the same API keys — gemini-2.0-flash has its own
+    # independent RPM quota per key, so this does not consume 2.5-flash quota.
+    # One attempt per account group, no cooldown check (last-resort fast sweep).
+    # Skips RPD-exhausted and 403-excluded keys; ignores RPM blocks from the
+    # primary pass since 2.0-flash RPM is independent.
+    if deadline and time.time() > deadline:
+        return None
+    _fallback_attempted = False
+    for gi_fb in range(n_groups):
+        gi = (start_group + gi_fb) % n_groups
+        fb_group_keys = [k for k in _ACCOUNT_GROUPS[gi]
+                         if k in GEMINI_KEYS
+                         and k not in _rpd_exhausted_keys
+                         and k not in _403_excluded_keys]
+        if not fb_group_keys:
+            continue
+        fb_key = fb_group_keys[0]  # one key per group — fast sweep
+        _fallback_attempted = True
+        try:
+            _key_last_used[fb_key] = time.time()
+            resp = requests.post(
+                f"{GEMINI_FALLBACK_URL}?key={fb_key}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": temperature,
+                                         "maxOutputTokens": max_tokens},
+                },
+                timeout=call_timeout,
+            )
+            if resp.status_code == 429:
+                continue  # RPM/RPD on this key — try next group
+            if resp.status_code in (500, 502, 503, 504):
+                continue  # 503 on fallback too — try next group
+            if resp.status_code == 403:
+                _403_excluded_keys.add(fb_key)
+                continue
+            resp.raise_for_status()
+            fb_body = resp.json()
+            fb_cands = fb_body.get("candidates", [])
+            if not fb_cands:
+                continue
+            fb_text = fb_cands[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+            if not fb_text:
+                continue
+            if fb_text.startswith("```"):
+                fb_text = re.sub(r"^```[^\n]*\n", "", fb_text)
+                fb_text = fb_text.rsplit("```", 1)[0].strip()
+            fb_parsed = json.loads(fb_text)
+            if isinstance(fb_parsed, list) and fb_parsed:
+                log(f"    ✅ Phase 1 fallback: {GEMINI_FALLBACK_MODEL} succeeded "
+                    f"(Account {_ACCOUNT_LABELS[gi]})")
+                return fb_parsed
+        except json.JSONDecodeError:
+            continue  # unparseable — try next group
+        except Exception:
+            continue  # any other error — try next group
+    if _fallback_attempted:
+        log(f"    ⚠️  Phase 1 fallback: {GEMINI_FALLBACK_MODEL} also failed on all groups")
 
     return None
 
@@ -3844,8 +3912,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         resp = None  # safe before first request; allows Retry-After header read in wait block
         full_rotations = 0
         _transient_503_count = 0  # C1: counts 503-only failures, never increments full_rotations
-        _MAX_503_ATTEMPTS = 2    # C1: 2 attempts max (15s + 20s = 35s total) — fall to MT fast,
-                                 # let the retry loop handle recovery once the outage clears
+        _MAX_503_ATTEMPTS = 3    # Phase 2: 3 attempts max (15s + 20s + 30s = 65s total).
+                                 # One extra attempt recovers batches during partial outages
+                                 # where a third try often succeeds, reducing MT-fallback rows
+                                 # that would otherwise flood the unified retry queue.
         _batch_start_time = time.time()  # for accurate elapsed-time reporting in 503 fallback message
         while full_rotations < MAX_RETRIES_429:
             try:
@@ -3978,7 +4048,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                         log(f"❌ Batch {batch_num}: 503 persisted for {_elapsed_503:.0f}s "
                             f"({_transient_503_count} attempts) — falling back to MT.")
                         return None
-                    _503_wait = 15 if _transient_503_count == 1 else 20  # 15s first, 20s second
+                    _503_wait = {1: 15, 2: 20}.get(_transient_503_count, 30)  # 15s, 20s, 30s
                     log(f"❌ Gemini 503 on batch {batch_num} "
                         f"(attempt {_transient_503_count}/{_MAX_503_ATTEMPTS}) "
                         f"— waiting {_503_wait}s...")
