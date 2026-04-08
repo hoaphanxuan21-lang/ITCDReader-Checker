@@ -98,6 +98,7 @@ GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
 _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for this run)
 _403_excluded_keys: set = set()   # D2: 403-excluded keys — suspended/forbidden, skip for entire run
+_last_rpm_cooldown_time: float = 0.0  # Fix E: timestamp of last completed RPM cooldown
 
 # Gemini keys use ITGEMINI_API_KEY naming to avoid collision with German pipeline.
 # Per-key last-used timestamps for cooldown tracking (Option 1).
@@ -1215,6 +1216,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
     # Round-robin starting group so consecutive retry rows don't always hit
     # the same account first. Within each group, pick the first cooled key.
     _rpm_blocked_groups = set()  # groups where 429-RPM was seen this call
+    _soft_none_groups = 0        # Fix D: groups that returned non-429 None (soft-503 / empty candidates)
     n_groups = len(_ACCOUNT_GROUPS)
     start_group = _retry_scan_offset % n_groups
     _retry_scan_offset += 1
@@ -1232,6 +1234,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             continue
 
         # Pick the first cooled key in this group
+        _group_got_result = False
         for api_key in group_keys:
             if not _is_cooled(api_key):
                 continue
@@ -1243,6 +1246,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                 if is_rpm:
                     _rpm_blocked_groups.add(gi)
                     log(f"    ℹ️ Account {_ACCOUNT_LABELS[gi]} RPM-blocked — skipping group")
+                    _group_got_result = True  # RPM response counts as "contacted" — not a soft-None
                     break  # skip rest of this group, try next account
                 if result is not None:
                     return result
@@ -1254,8 +1258,26 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             except Exception as e:
                 log(f"    ⚠️ Account {_ACCOUNT_LABELS[gi]} key error: {e}")
                 # On exception, don't burn remaining keys in this group — move to next account
+                _group_got_result = True  # exception counts as "contacted" — not a soft-None
                 break
-        # After trying all cooled keys in this group with no success, move to next group
+        # After trying all cooled keys in this group with no success:
+        # If the group was neither RPM-blocked nor raised an exception, all its cooled
+        # keys returned soft-None (empty candidates / 200-but-no-content — a known
+        # Gemini high-load pattern during outages). Count it for Fix D backoff.
+        if not _group_got_result and gi not in _rpm_blocked_groups:
+            _soft_none_groups += 1
+
+    # Fix D: if every non-RPM-blocked group returned only soft Nones, Gemini is
+    # in a high-load state (returning HTTP 200 with empty candidates rather than
+    # raising a 503). Apply a brief backoff before the second pass so the
+    # infrastructure has a moment to recover — prevents tight spinning across
+    # all keys with zero useful calls.
+    _non_blocked_groups = n_groups - len(_rpm_blocked_groups)
+    if _soft_none_groups > 0 and _soft_none_groups >= _non_blocked_groups:
+        _soft_backoff = 7  # 7s — enough for one RPM window tick, short enough not to stall retry loops
+        log(f"    ℹ️ Fix D: all {_soft_none_groups} non-RPM-blocked group(s) returned soft-None "
+            f"— waiting {_soft_backoff}s before second pass (possible Gemini high-load).")
+        time.sleep(_soft_backoff)
 
     # ── Second pass: wait for soonest key across non-blocked groups ────────
     if deadline and time.time() > deadline:
@@ -1288,7 +1310,11 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                 wait_secs = min(wait_secs, remaining)
             time.sleep(wait_secs)
 
-        # Try the soonest-cooled key
+        # Try the soonest-cooled key(s).
+        # Fix D: during soft-None outages the second pass must try more than one key —
+        # the original `break` after a single attempt meant one soft-None exhausted the
+        # entire second pass. Try up to 3 cooled keys before giving up.
+        _second_pass_attempts = 0
         for k in available_keys:
             if _is_cooled(k):
                 try:
@@ -1298,14 +1324,17 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                         continue
                     if not is_rpm and result is not None:
                         return result
+                    # Soft-None or RPM on this key — try the next cooled key
+                    _second_pass_attempts += 1
                 except Exception:
-                    pass
-                break  # one attempt only
+                    _second_pass_attempts += 1
+                if _second_pass_attempts >= 3:
+                    break  # give up after 3 attempts in the second pass
 
     return None
 
 def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
-                   glossary_terms=None, register_block=None):
+                   glossary_terms=None, register_block=None, max_retries=None):
     """Identify and retry rows that are verbatim, too similar to MT, or truncated.
 
     bleed_sorts: dict of sort → reason ('bleed'|'bgs'|'truncated') from _force_retry_sorts.
@@ -1392,10 +1421,16 @@ def _unified_retry(all_rephrased, input_data, rows, bleed_sorts=None,
     # Soft cap — raised from 20 to 35 now that key 28 is correctly protected from
     # RPM misclassification and won't be permanently killed mid-retry loop.
     # High-similarity chapters (25+ flagged rows) were systematically under-retried.
-    if len(retry_candidates) > _MAX_RETRIES:
-        log(f"  ⚠️  Unified retry: {len(retry_candidates)} rows flagged — capped at {_MAX_RETRIES}")
+    #
+    # Fix B: when all (or most) batches fell back to MT due to 503, raise the cap
+    # dynamically so unified retry can rescue as many rows as possible. The caller
+    # passes max_retries computed from batch failure rate; fall back to _MAX_RETRIES.
+    _effective_max_retries = max_retries if max_retries is not None else _MAX_RETRIES
+    if len(retry_candidates) > _effective_max_retries:
+        log(f"  ⚠️  Unified retry: {len(retry_candidates)} rows flagged — capped at {_effective_max_retries}"
+            + (" (Fix B: dynamic cap — batch 503-fallback)" if max_retries is not None and max_retries != _MAX_RETRIES else ""))
         sorted_cands = sorted(retry_candidates.items(), key=lambda x: -len(x[1][0].split()))
-        retry_candidates = dict(sorted_cands[:_MAX_RETRIES])
+        retry_candidates = dict(sorted_cands[:_effective_max_retries])
 
     log(f"  \U0001f504 Unified retry: {len(retry_candidates)} row(s) to retry...")
     for sort_n, (out, ref, reason) in retry_candidates.items():
@@ -1809,11 +1844,30 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
     # keys are still in their RPM window and every recovery call will timeout
     # waiting for a cooled key. Same pattern as _PRE_RETRY_COOLDOWN in the
     # main pipeline — clear RPM state and wait for windows to expire.
-    _cooldown_s = 65
-    log(f"  \u23f3 Recovery: RPM cooldown — waiting {_cooldown_s}s for key windows to expire...")
-    _exhausted_keys.intersection_update(_rpd_exhausted_keys)  # clear RPM state, keep RPD
-    time.sleep(_cooldown_s)
-    log(f"  \u2705 Recovery: RPM cooldown complete — starting re-edit calls.")
+    #
+    # Fix E: if the main pipeline RPM cooldown ran within the last 5 minutes,
+    # the keys are already fresh and a second full 65s wait is unnecessary.
+    # During a sustained 503 outage the main cooldown is skipped (Fix A), so
+    # _last_rpm_cooldown_time stays at 0 and this check falls through to the
+    # full recovery cooldown — correct behaviour.
+    _time_since_main_cooldown = time.time() - _last_rpm_cooldown_time
+    if _last_rpm_cooldown_time > 0 and _time_since_main_cooldown < 300:
+        # Main cooldown ran less than 5 min ago — compute remaining top-up needed.
+        _cooldown_s = max(0, int(65 - _time_since_main_cooldown))
+        if _cooldown_s <= 5:
+            log(f"  \u23ed\ufe0f  Fix E: main RPM cooldown ran {_time_since_main_cooldown:.0f}s ago "
+                f"\u2014 skipping recovery cooldown (keys already fresh).")
+        else:
+            log(f"  \u23f3 Fix E: main RPM cooldown ran {_time_since_main_cooldown:.0f}s ago "
+                f"\u2014 top-up wait {_cooldown_s}s (instead of full 65s).")
+            _exhausted_keys.intersection_update(_rpd_exhausted_keys)
+            time.sleep(_cooldown_s)
+    else:
+        _cooldown_s = 65
+        log(f"  \u23f3 Recovery: RPM cooldown \u2014 waiting {_cooldown_s}s for key windows to expire...")
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)  # clear RPM state, keep RPD
+        time.sleep(_cooldown_s)
+    log(f"  \u2705 Recovery: RPM cooldown complete \u2014 starting re-edit calls.")
 
     corrections = []
     _consecutive_failures = 0
@@ -3338,7 +3392,7 @@ def _build_register_block(processed_rows):
 
 
 def rephrase_with_gemini(rows, glossary_terms, book_name):
-    global _batch_account_offset
+    global _batch_account_offset, _last_rpm_cooldown_time
     if not GEMINI_KEYS:
         log("❌ No GEMINI_API_KEY configured.")
         return None
@@ -4057,6 +4111,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     _force_retry_sorts: dict = {}    # Remedy A: sorts from trunc-guard for unconditional retry
     _register_block = ''  # built from processed rows; injected into batches 2+
     _prev_batch_503_fail = False    # C2: True when the previous batch failed due to 503 outage
+    _any_batch_success = False      # Fix A: True if at least one batch got a Gemini response
+    _consecutive_503_fails = 0      # Fix C: consecutive all-503 batch failures
+    _503_failed_batches = 0         # Fix B: total batches that fell back to MT
     key_count = len(GEMINI_KEYS)
     _ag_info = ", ".join(f"{_ACCOUNT_LABELS[i]}:{len(g)}" for i, g in enumerate(_ACCOUNT_GROUPS) if g)
     log(f"  Using {key_count} Gemini key(s) across {len(_ACCOUNT_GROUPS)} accounts ({_ag_info}) with group rotation.")
@@ -4073,6 +4130,25 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             log(f"  ⚠️  Batch {i} failed — falling back to MT for {len(batch)} rows.")
             result = [{"sort": r.get("sort"), "content": r.get("content", "")} for r in batch]
             _prev_batch_503_fail = True   # C2: flag for extra recovery wait before next batch
+            _503_failed_batches += 1      # Fix B: count total MT-fallback batches
+            _consecutive_503_fails += 1   # Fix C: consecutive counter
+            # Fix C: if 2 consecutive batches all failed on 503, the outage is sustained.
+            # Skip remaining batches — unified retry is more resilient than continued
+            # batch attempts under an active outage, and avoids accumulating C2 waits.
+            if _consecutive_503_fails >= 2 and i < total_batches:
+                _skipped_n = total_batches - i
+                log(f"  \u26d4 Fix C: {_consecutive_503_fails} consecutive batch 503-failures "
+                    f"— skipping {_skipped_n} remaining batch(es) and proceeding to unified retry.")
+                # Fill remaining batches with MT fallback so no rows are lost
+                all_rephrased.extend(result)  # add current batch first
+                for _sb in batches[i:]:       # then remaining (i is 1-based, batches[i:] is correct)
+                    _sb_result = [{"sort": r.get("sort"), "content": r.get("content", "")} for r in _sb]
+                    all_rephrased.extend(_sb_result)
+                    _503_failed_batches += 1
+                break
+        else:
+            _any_batch_success = True     # Fix A: at least one batch got a real Gemini response
+            _consecutive_503_fails = 0    # Fix C: reset consecutive counter on success
         # ── Guard 1: Missing-sort reconciliation ────────────────────────────────
         # Gemini occasionally returns fewer rows than were sent (output truncation,
         # dropped rows under context pressure). Any missing sort number means that
@@ -4320,18 +4396,42 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # The result is a perpetual 1-row-per-15s trickle and massive deterministic fallback.
     # Fix: sleep 65s before the retry loop when there were ≥2 batches, so ALL batch-used
     # keys exit their RPM windows simultaneously and the retry loop gets a clean pool.
-    if total_batches >= 2 and not _all_keys_rpd_dead():
+    #
+    # Fix A: skip the cooldown entirely when no batch succeeded (all fell back to MT).
+    # If no Gemini call was made in the batch phase, no RPM quota was consumed and
+    # the cooldown is a pure waste of time (65s during an already slow outage run).
+    if total_batches >= 2 and not _all_keys_rpd_dead() and _any_batch_success:
         _cooldown = _PRE_RETRY_COOLDOWN
         log(f"  ⏳ Pre-retry RPM cooldown: {total_batches} batch(es) completed — waiting {_cooldown}s for RPM windows to expire...")
         time.sleep(_cooldown)
         _exhausted_keys.intersection_update(_rpd_exhausted_keys)
         log(f"  ✅ RPM cooldown complete — retry loop starting with fresh key pool.")
+        _last_rpm_cooldown_time = time.time()
+    elif total_batches >= 2 and not _any_batch_success:
+        log(f"  ⏭  Fix A: no batch succeeded (all 503-fallback) — skipping RPM cooldown (no quota consumed).")
+
+    # Fix B: compute dynamic retry cap based on batch failure rate.
+    # When all (or most) batches fell back to MT on 503, unified retry is the
+    # only mechanism to rescue rows. The normal cap of 45 was designed for
+    # partial-failure (a few missed rows), not total-failure (all rows verbatim).
+    # Raise to min(total_verbatim_rows, time-budget ceiling) when ≥50% of batches
+    # failed. Ceiling of 100 is conservative — unified retry succeeds at ~95% per
+    # row even through partial 503 outages (observed in this run: 43/45 OK).
+    _dynamic_max_retries = _MAX_RETRIES
+    if _503_failed_batches > 0:
+        _fail_ratio = _503_failed_batches / max(total_batches, 1)
+        if _fail_ratio >= 0.5:
+            # All or majority of batches failed — raise cap to rescue as many rows as possible
+            _dynamic_max_retries = min(len(gemini_input_data), 100)
+            log(f"  ⬆️  Fix B: {_503_failed_batches}/{total_batches} batches 503-failed "
+                f"— raising unified retry cap {_MAX_RETRIES}→{_dynamic_max_retries}")
 
     # Unified retry: identify and re-request verbatim, similar, or truncated rows
     all_rephrased = _unified_retry(sorted_rows, input_data, rows,
                                     bleed_sorts=_force_retry_sorts,
                                     glossary_terms=glossary_terms,
-                                    register_block=_register_block)
+                                    register_block=_register_block,
+                                    max_retries=_dynamic_max_retries)
 
     # Re-run post-processing on retry output to ensure retried rows get
     # the same treatment (Pass QE, comma rules, glossary enforcement, etc.)
