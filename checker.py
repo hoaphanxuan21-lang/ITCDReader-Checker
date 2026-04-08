@@ -44,6 +44,19 @@ GEMINI_URL  = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_
 # same API keys (separate per-model RPM quota — does not consume 2.5-flash quota).
 GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
 GEMINI_FALLBACK_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_FALLBACK_MODEL}:generateContent"
+# Phase 3: Vertex AI fallback — fires only when both gemini-2.5-flash AND
+# gemini-2.0-flash fail on all groups (gateway-level outage on
+# generativelanguage.googleapis.com). Vertex AI uses aiplatform.googleapis.com,
+# a completely separate infrastructure tier with enterprise SLA — unaffected
+# by developer API congestion events. Requires two GitHub Actions secrets:
+#   GOOGLE_VERTEX_SA_JSON  — full service account JSON (from Cloud Console)
+#   GOOGLE_VERTEX_PROJECT  — GCP project ID (e.g. "my-project-123")
+# If either secret is missing, Phase 3 is silently skipped (backwards compatible).
+# Cost: ~$0.001/row, fires only during total outages — negligible in practice.
+VERTEX_SA_JSON   = os.environ.get("GOOGLE_VERTEX_SA_JSON",  "")
+VERTEX_PROJECT   = os.environ.get("GOOGLE_VERTEX_PROJECT",  "")
+VERTEX_LOCATION  = "us-central1"
+VERTEX_MODEL     = "gemini-2.5-flash"  # same model quality, separate infrastructure
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("IT_TELEGRAM_BOT_TOKEN", "")
@@ -1383,6 +1396,79 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             continue  # any other error — try next group
     if _fallback_attempted:
         log(f"    ⚠️  Phase 1 fallback: {GEMINI_FALLBACK_MODEL} also failed on all groups")
+
+    # ── Phase 3: Vertex AI fallback ────────────────────────────────────────────────────────
+    # Fires when both gemini-2.5-flash and gemini-2.0-flash have failed on
+    # all account groups — confirming gateway-level saturation on
+    # generativelanguage.googleapis.com. Vertex AI (aiplatform.googleapis.com)
+    # is a separate infrastructure tier unaffected by developer API outages.
+    # Silently skipped if VERTEX_SA_JSON or VERTEX_PROJECT secrets are not set.
+    if VERTEX_SA_JSON and VERTEX_PROJECT:
+        if deadline and time.time() > deadline:
+            return None
+        try:
+            # ─ Authenticate: exchange service account JSON for OAuth2 bearer token ─
+            import json as _vx_json
+            from google.oauth2 import service_account as _vx_sa
+            from google.auth.transport.requests import Request as _VxRequest
+            _sa_info = _vx_json.loads(VERTEX_SA_JSON)
+            _vx_creds = _vx_sa.Credentials.from_service_account_info(
+                _sa_info,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            _vx_creds.refresh(_VxRequest())
+            _vx_token = _vx_creds.token
+
+            # ─ Call Vertex AI endpoint ─────────────────────────────────────────────────
+            _vx_url = (
+                f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
+                f"/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}"
+                f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
+            )
+            _vx_resp = requests.post(
+                _vx_url,
+                headers={
+                    "Authorization": f"Bearer {_vx_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "maxOutputTokens": max_tokens,
+                    },
+                },
+                timeout=call_timeout,
+            )
+            if _vx_resp.status_code != 200:
+                log(f"    ⚠️  Phase 3 Vertex AI: HTTP {_vx_resp.status_code} — "
+                    f"{_vx_resp.text[:120]}")
+            else:
+                _vx_body = _vx_resp.json()
+                _vx_cands = _vx_body.get("candidates", [])
+                if _vx_cands:
+                    _vx_text = (
+                        _vx_cands[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                        .strip()
+                    )
+                    if _vx_text:
+                        if _vx_text.startswith("```"):
+                            _vx_text = re.sub(r"^```[^\n]*\n", "", _vx_text)
+                            _vx_text = _vx_text.rsplit("```", 1)[0].strip()
+                        _vx_parsed = json.loads(_vx_text)
+                        if isinstance(_vx_parsed, list) and _vx_parsed:
+                            log("    ✅ Phase 3 Vertex AI fallback succeeded")
+                            return _vx_parsed
+        except ImportError:
+            log("    ⚠️  Phase 3 Vertex AI: google-auth not installed "
+                "(add google-auth to pip install in main.yml)")
+        except json.JSONDecodeError:
+            log("    ⚠️  Phase 3 Vertex AI: unparseable JSON response")
+        except Exception as _vx_err:
+            log(f"    ⚠️  Phase 3 Vertex AI error: {_vx_err}")
 
     return None
 
