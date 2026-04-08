@@ -4,6 +4,25 @@ on:
   schedule:
     - cron: '*/30 * * * *'   # every 30 minutes
   workflow_dispatch:          # manual trigger
+    inputs:
+      override_chapter_id:
+        description: 'Override: chapter processing ID (skip Task Center + claiming)'
+        required: false
+        default: ''
+        type: string
+      override_book_id:
+        description: 'Override: book ID (for glossary lookup; leave empty to skip glossary)'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Dry run (process but do not submit/finish)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   process-chapter:
@@ -72,6 +91,6 @@ jobs:
           GOOGLE_VERTEX_SA_JSON:     ${{ secrets.GOOGLE_VERTEX_SA_JSON }}
           GOOGLE_VERTEX_PROJECT:     ${{ secrets.GOOGLE_VERTEX_PROJECT }}
           TEST_MODE:                 "false"
-          OVERRIDE_CHAPTER_ID:       ${{ secrets.OVERRIDE_CHAPTER_ID }}
-          OVERRIDE_BOOK_ID:          ${{ secrets.OVERRIDE_BOOK_ID }}
-          DRY_RUN:                   "false"
+          OVERRIDE_CHAPTER_ID:       ${{ inputs.override_chapter_id || '' }}
+          OVERRIDE_BOOK_ID:          ${{ inputs.override_book_id || '' }}
+          DRY_RUN:                   ${{ inputs.dry_run || 'false' }}
