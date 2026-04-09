@@ -56,7 +56,7 @@ GEMINI_FALLBACK_URL = f"https://generativelanguage.googleapis.com/v1beta/models/
 VERTEX_SA_JSON   = os.environ.get("GOOGLE_VERTEX_SA_JSON",  "")
 VERTEX_PROJECT   = os.environ.get("GOOGLE_VERTEX_PROJECT",  "")
 VERTEX_LOCATION  = "us-central1"
-VERTEX_MODEL     = "gemini-2.5-flash"  # same model quality, separate infrastructure
+VERTEX_MODEL     = "gemini-2.5-flash"  # same model as primary, separate infrastructure (Vertex AI)
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("IT_TELEGRAM_BOT_TOKEN", "")
@@ -261,7 +261,7 @@ _vx_cached_token_expiry: float = 0.0   # epoch time when cached token expires
 def _next_gemini_key(prefer_group=None):
     """Return the next non-exhausted Gemini API key, or None if all exhausted.
     
-    If prefer_group is specified (0=A, 1=B, 2=C), tries that account's keys first
+    If prefer_group is specified (0=A, 1=B, 2=C, 3=D), tries that account's keys first
     before falling through to other accounts. This spreads RPD load across accounts.
     """
     if prefer_group is not None and 0 <= prefer_group < len(_ACCOUNT_GROUPS):
@@ -1090,7 +1090,42 @@ _SYNONYMS = [
     (r'\bscena\b', 'spettacolo'),
     (r'\btirarlo\b', 'trascinarlo'),
     (r'\bsilenziosamente\b', 'in silenzio'),
+    # Session 13: common fiction verbs previously missing (reduce 'no fallback possible')
+    (r'\baprì\b', 'spalancò'),         # spalancò: "flung open" — safe intensifier for aprì
+    (r'\buscì\b', 'se ne andò'),       # se ne andò: neutral exit verb
+    (r'\bentrò\b', 'fece ingresso'),   # fece ingresso: formal variant of entrò
+    (r'\bcorse\b', 'si precipitò'),    # si precipitò: "rushed" — safe near-synonym
+    (r'\bcadde\b', 'precipitò'),       # precipitò: "fell/plummeted" — safe for cadde
 ]
+
+
+def _quote_protected_ranges(text):
+    """Build list of (start, end) char-index ranges inside “...” or "..." quotes.
+    Shared by _find_synonym_pair and _deterministic_change."""
+    ranges = []
+    i = 0
+    while i < len(text):
+        if text[i] in ('“', '"'):
+            close = '”' if text[i] == '“' else '"'
+            j = text.find(close, i + 1)
+            if j == -1:
+                j = len(text) - 1
+            if j != -1:
+                ranges.append((i, j))
+                i = j + 1
+                continue
+        i += 1
+    return ranges
+
+
+def _match_outside_quotes(text, quote_ranges, match_start, match_end):
+    """True if match is outside all quote ranges AND not in an attribution zone (~20 chars of a quote)."""
+    if any(qs <= match_start and match_end <= qe + 1 for qs, qe in quote_ranges):
+        return False
+    nearby = text[max(0, match_start - 20): match_end + 20]
+    if re.search(r'["“”]', nearby):
+        return False
+    return True
 
 
 def _find_synonym_pair(text):
@@ -1105,36 +1140,10 @@ def _find_synonym_pair(text):
 
     Returns None if no synonym matches outside quotes (very short rows, pure dialogue).
     """
-    # Build a set of character index ranges that are inside "..." or "..." quotes
-    _quote_ranges = []
-    _i = 0
-    while _i < len(text):
-        if text[_i] in ('\u201c', '"'):  # U+201C curly open or straight "
-            _close = '\u201d' if text[_i] == '\u201c' else '"'
-            _j = text.find(_close, _i + 1)
-            if _j == -1:
-                _j = len(text) - 1  # fallback: end of text
-            if _j != -1:
-                _quote_ranges.append((_i, _j))
-                _i = _j + 1
-                continue
-        _i += 1
-
-    def _in_quotes(match_start, match_end):
-        return any(qs <= match_start and match_end <= qe + 1
-                   for qs, qe in _quote_ranges)
-
-    def _in_attribution_zone(match_start, match_end):
-        """True if the match is within ~20 chars of a quote boundary.
-        Prevents substituting words in attribution clauses (disse piano →
-        disse sommessamente) which would introduce register-wrong vocabulary
-        immediately adjacent to the dialogue they introduce or follow."""
-        nearby = text[max(0, match_start - 20): match_end + 20]
-        return bool(re.search(r'["\u201c\u201d]', nearby))
-
+    _qr = _quote_protected_ranges(text)
     for pattern, replacement in _SYNONYMS:
         m = re.search(pattern, text)
-        if m and not _in_quotes(m.start(), m.end()) and not _in_attribution_zone(m.start(), m.end()):
+        if m and _match_outside_quotes(text, _qr, m.start(), m.end()):
             return (m.group(0), replacement)
     return None
 
@@ -1149,37 +1158,29 @@ def _deterministic_change(text):
     Strategy: try synonym substitutions in priority order; apply the FIRST match only.
     Skips matches inside quoted speech (consistent with _find_synonym_pair).
     """
-    # Build quote-protected ranges (Italian “...” or straight "...")
-    _quote_ranges = []
-    _i = 0
-    while _i < len(text):
-        if text[_i] in ('\u201c', '"'):  # U+201C curly open or straight "
-            _close = '\u201d' if text[_i] == '\u201c' else '"'
-            _j = text.find(_close, _i + 1)
-            if _j == -1:
-                _j = len(text) - 1  # fallback: end of text
-            if _j != -1:
-                _quote_ranges.append((_i, _j))
-                _i = _j + 1
-                continue
-        _i += 1
-
-    def _in_quotes(match_start, match_end):
-        return any(qs <= match_start and match_end <= qe + 1
-                   for qs, qe in _quote_ranges)
-
-    def _in_attribution_zone(match_start, match_end):
-        """Same attribution-zone guard as _find_synonym_pair."""
-        nearby = text[max(0, match_start - 20): match_end + 20]
-        return bool(re.search(r'["\u201c\u201d]', nearby))
-
+    _qr = _quote_protected_ranges(text)
     for pattern, replacement in _SYNONYMS:
         m = re.search(pattern, text)
-        if m and not _in_quotes(m.start(), m.end()) and not _in_attribution_zone(m.start(), m.end()):
+        if m and _match_outside_quotes(text, _qr, m.start(), m.end()):
             return re.sub(pattern, replacement, text, count=1)
     # No synonym matched (very short row, exclamation, single name, etc.) — return as-is.
     # Comma→semicolon was removed: it frequently broke syntax where a comma is
     # grammatically required (subordinate clauses, enumeration, inline attribution).
+    return text
+
+
+def _clean_llm_json(text):
+    """Strip markdown fences and trailing JSON artifacts from LLM output.
+
+    Shared by _call_vertex_ai, _call_vertex_ai_batch, _call_gemini_simple (_one_call),
+    and Phase 1 fallback. Centralised so edge-case fixes only need one patch site.
+    Returns cleaned text (still a string — caller must json.loads).
+    """
+    if text.startswith("```"):
+        text = re.sub(r"^```[^\n]*\n", "", text)
+        text = text.rsplit("```", 1)[0].strip()
+    # Trailing ]] / }`] artifacts from Gemini's JSON output
+    text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', text)
     return text
 
 
@@ -1244,10 +1245,7 @@ def _call_vertex_ai(prompt, temperature=0.5, max_tokens=2048, call_timeout=25):
         )
         if not _vx_text:
             return None
-        if _vx_text.startswith("```"):
-            _vx_text = re.sub(r"^```[^\n]*\n", "", _vx_text)
-            _vx_text = _vx_text.rsplit("```", 1)[0].strip()
-        _vx_text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', _vx_text)
+        _vx_text = _clean_llm_json(_vx_text)
         _vx_parsed = _vx_json.loads(_vx_text)
         if isinstance(_vx_parsed, list) and _vx_parsed:
             return _vx_parsed
@@ -1257,6 +1255,104 @@ def _call_vertex_ai(prompt, temperature=0.5, max_tokens=2048, call_timeout=25):
         log("    ⚠️  Phase 3 Vertex AI: unparseable JSON response")
     except Exception as _vx_err:
         log(f"    ⚠️  Phase 3 Vertex AI error: {_vx_err}")
+    return None
+
+
+def _call_vertex_ai_batch(prompt, row_count, call_timeout=90):
+    """Vertex AI batch fallback — fires when all AI Studio gateway attempts are 503.
+
+    Sends the same full batch prompt to Vertex AI (aiplatform.googleapis.com),
+    which is completely separate infrastructure from generativelanguage.googleapis.com.
+    A total 503 outage on the AI Studio gateway does not affect Vertex AI.
+
+    Key differences from _call_vertex_ai (single-row):
+      - thinkingBudget=0: thinking tokens are disabled. Without this, gemini-2.5-flash
+        would think for the entire 40-row batch (~600 tokens × 40 = 24K extra output
+        tokens), making the call slower than the current retry-loop path and
+        increasing cost ~10× vs what we'd spend in the retry loop. With thinking off,
+        batch quality is equivalent to what AI Studio batch produces normally.
+      - maxOutputTokens=16384: matches the AI Studio batch call (needs headroom for
+        40 rows of Italian prose).
+      - responseMimeType="application/json": instructs the model to return only JSON,
+        consistent with how AI Studio batch calls work.
+      - call_timeout=90: longer than single-row (25s) to accommodate 40-row output.
+      - Reuses _vx_cached_token (shared with _call_vertex_ai) — no double auth overhead.
+
+    Returns parsed JSON list or None on any failure.
+    """
+    global _vx_cached_token, _vx_cached_token_expiry
+    if not VERTEX_SA_JSON or not VERTEX_PROJECT:
+        return None
+    try:
+        import json as _vx_json
+        now = time.time()
+        # Reuse cached token (shared cache with _call_vertex_ai single-row calls)
+        if _vx_cached_token and now < _vx_cached_token_expiry:
+            _vx_token = _vx_cached_token
+        else:
+            from google.oauth2 import service_account as _vx_sa
+            from google.auth.transport.requests import Request as _VxRequest
+            _sa_info = _vx_json.loads(VERTEX_SA_JSON)
+            _vx_creds = _vx_sa.Credentials.from_service_account_info(
+                _sa_info,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            _vx_creds.refresh(_VxRequest())
+            _vx_token = _vx_creds.token
+            _vx_cached_token = _vx_token
+            _vx_cached_token_expiry = now + 3500  # refresh 100s before expiry
+
+        _vx_url = (
+            f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
+            f"/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}"
+            f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
+        )
+        _vx_resp = requests.post(
+            _vx_url,
+            headers={
+                "Authorization": f"Bearer {_vx_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.25,
+                    "maxOutputTokens": 16384,
+                    "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingBudget": 0},  # disable thinking for batch
+                },
+            },
+            timeout=call_timeout,
+        )
+        if _vx_resp.status_code != 200:
+            log(f"    ⚠️  Vertex AI batch: HTTP {_vx_resp.status_code} — "
+                f"{_vx_resp.text[:120]}")
+            return None
+        _vx_body = _vx_resp.json()
+        _vx_cands = _vx_body.get("candidates", [])
+        if not _vx_cands:
+            log(f"    ⚠️  Vertex AI batch: empty candidates in response")
+            return None
+        _vx_text = (
+            _vx_cands[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        )
+        if not _vx_text:
+            log(f"    ⚠️  Vertex AI batch: empty text in response")
+            return None
+        # Apply same JSON cleaning as _call_vertex_ai (single-row)
+        _vx_text = _clean_llm_json(_vx_text)
+        _vx_parsed = _vx_json.loads(_vx_text)
+        if isinstance(_vx_parsed, list) and _vx_parsed:
+            log(f"    ✅ Vertex AI batch: {len(_vx_parsed)} rows returned "
+                f"(requested {row_count})")
+            return _vx_parsed
+        log(f"    ⚠️  Vertex AI batch: parsed result is empty or not a list")
+    except ImportError:
+        log("    ⚠️  Vertex AI batch: google-auth not installed")
+    except json.JSONDecodeError as _vb_err:
+        log(f"    ⚠️  Vertex AI batch: JSON parse error — {_vb_err}")
+    except Exception as _vb_err:
+        log(f"    ⚠️  Vertex AI batch error: {_vb_err}")
     return None
 
 
@@ -1307,8 +1403,17 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             _consecutive_vertex_only += 1
             log("    ✅ Phase 3 Vertex AI fallback succeeded")
             return result
-        # Vertex also failed — gateway may have recovered, fall through to primary
-        log("    ⚠️  Vertex AI failed on fast-path — falling back to primary model")
+        # First attempt failed (e.g. unparseable JSON) — retry once before resetting.
+        # Transient JSON errors shouldn't reset the counter and trigger ~47s of wasted
+        # primary 503 attempts when the gateway is confirmed down.
+        log("    ⚠️  Vertex AI fast-path: first attempt failed — retrying once")
+        result = _call_vertex_ai(prompt, temperature, max_tokens, call_timeout=25)
+        if result is not None:
+            _consecutive_vertex_only += 1
+            log("    ✅ Phase 3 Vertex AI fallback succeeded (retry)")
+            return result
+        # Both attempts failed — Vertex may be down, fall through to primary
+        log("    ⚠️  Vertex AI failed twice on fast-path — falling back to primary model")
         _consecutive_vertex_only = 0
 
     _paid_key = _PAID_KEY if _PAID_KEY else None
@@ -1378,9 +1483,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         if not text:
             log(f"    ⚠️ Gemini returned empty text (finishReason={candidates[0].get('finishReason', '?')})")
             return None, False, False
-        if text.startswith("```"):
-            text = re.sub(r"^```[^\n]*\n", "", text); text = text.rsplit("```", 1)[0].strip()
-        text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', text)  # trailing ]] fix
+        text = _clean_llm_json(text)
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
@@ -1590,10 +1693,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             fb_text = fb_cands[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
             if not fb_text:
                 continue
-            if fb_text.startswith("```"):
-                fb_text = re.sub(r"^```[^\n]*\n", "", fb_text)
-                fb_text = fb_text.rsplit("```", 1)[0].strip()
-            fb_text = re.sub(r'(\])\s*[\]}`]+\s*$', r'\1', fb_text)  # trailing ]] fix
+            fb_text = _clean_llm_json(fb_text)
             fb_parsed = json.loads(fb_text)
             if isinstance(fb_parsed, list) and fb_parsed:
                 log(f"    ✅ Phase 1 fallback: {GEMINI_FALLBACK_MODEL} succeeded "
@@ -2116,7 +2216,7 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
 # ─── Remedy D: ErrMessage10 self-healing recovery ─────────────────────────────
 _MAX_RETRIES       = 45  # max rows retried per chapter (raised from 35 — C3 fix)
 _RECOVERY_MAX_ROWS = 15
-_RECOVERY_SIM_THRESHOLD = 0.80  # wider net than SIM_THRESHOLD — Italian CDReader is stricter
+_RECOVERY_SIM_THRESHOLD = 0.80  # same as SIM_THRESHOLD — recovery targets the same rejection zone
 
 _RECOVERY_PROMPT = (
     "You are an experienced Italian editor working on machine-translated fiction. "
@@ -4141,8 +4241,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
 
 
-    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None, register_block=''):
-        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first, register_block=register_block)
+    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None, register_block='', prebuilt_prompt=None):
+        # Accept pre-built prompt from caller (avoids double call when Vertex batch
+        # fallback also needs the same prompt string on 503 failure).
+        if prebuilt_prompt is not None:
+            batch_prompt = prebuilt_prompt
+        else:
+            batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first, register_block=register_block)
 
         # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
         # RPD-exhausted keys (daily quota) are marked permanently and never retried.
@@ -4454,7 +4559,25 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _preferred_group = _batch_account_offset % len(_ACCOUNT_GROUPS) if _ACCOUNT_GROUPS else 0
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini (prefer Account {_ACCOUNT_LABELS[_preferred_group]})...")
         next_first = batches[i][0] if i < total_batches else None
-        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first, register_block=_register_block)
+        # Build prompt once — reused by _call_gemini and, on failure, _call_vertex_ai_batch.
+        # _build_prompt is pure/deterministic so this replaces the internal call inside
+        # _call_gemini without any semantic change.
+        _batch_prompt, _ = _build_prompt(batch, i, total_batches, next_batch_first=next_first, register_block=_register_block)
+        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first, register_block=_register_block, prebuilt_prompt=_batch_prompt)
+        # ── Vertex AI batch fallback (Phase B) ───────────────────────────────────
+        # Fires when _call_gemini returns None (all 3 × 503 attempts exhausted).
+        # Uses the same prompt already built above — no extra token/API cost for the
+        # prompt itself. Thinking is explicitly disabled (thinkingBudget=0) so latency
+        # and cost are comparable to a normal AI Studio batch call (~$0.013/batch).
+        if result is None and VERTEX_SA_JSON and VERTEX_PROJECT:
+            log(f"  ⚡ Vertex AI batch fallback: attempting {len(batch)} rows "
+                f"(all gateway attempts 503)...")
+            result = _call_vertex_ai_batch(_batch_prompt, len(batch))
+            if result is not None:
+                log(f"  ✅ Vertex AI batch fallback succeeded — {len(result)} rows")
+                _any_batch_success = True
+                _consecutive_503_fails = 0   # reset — batch succeeded via Vertex
+                _prev_batch_503_fail = False  # no extra C2 sleep before next batch
         _batch_account_offset += 1  # rotate to next account for next batch
         if result is None:
             # Fall back to MT content for this batch — the similarity guard will
@@ -5347,40 +5470,6 @@ def _run_inner(token):
             send_telegram(msg)
             return
 
-        # ── Post-process: replace English quotes with Italian quotes ─────────────────
-        # Groq and sometimes Gemini use " instead of „/". Fix deterministically.
-        quote_fixes = 0
-        for row in rephrased:
-            c = row.get("content", "")
-            if '"' not in c:
-                continue
-            # Replace paired English quotes: "text" → „text"
-            # Strategy: first " in a pair → „, second " → "
-            fixed = ""
-            in_quote = False
-            i = 0
-            while i < len(c):
-                ch = c[i]
-                if ch == '"':
-                    if not in_quote:
-                        fixed += '"'  # " opening (straight quote)
-                        in_quote = True
-                    else:
-                        fixed += '"'  # " closing (straight quote)
-                        in_quote = False
-                else:
-                    fixed += ch
-                i += 1
-            # If still in_quote (odd number of "), the last " is likely a standalone closing
-            # Revert to original to avoid mangling
-            if in_quote:
-                fixed = c  # don't touch malformed rows
-            if fixed != c:
-                row["content"] = fixed
-                quote_fixes += 1
-        if quote_fixes:
-            log(f"  🔤 Post-processing: converted English quotes to Italian in {quote_fixes} row(s).")
-
         # ── Post-process: fix "X family" / "famiglia X" format ───────────────
         # Two separate patterns to avoid IGNORECASE corrupting the uppercase-name check:
         # Pattern A: hyphenated "Surname" (not common in Italian, but safe to check) — safe, no article ambiguity
@@ -5739,7 +5828,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Keys configured: {len(GEMINI_KEYS)}/{28}\n"
+        f"🔑 Keys configured: {len(GEMINI_KEYS)}/{37}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
