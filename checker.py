@@ -38,14 +38,16 @@ BASE_URL    = "https://translatorserverwebapi-it.cdreader.com/api"
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL  = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 # Phase 1: fallback model for _call_gemini_simple when all groups 503-fail.
-# gemini-2.0-flash runs on separate serving infrastructure from 2.5-flash —
-# outages on the 2.5-flash tier do not co-degrade 2.0-flash. Quality for
-# short single-row Italian rephrasing prompts is fully adequate. Uses the
-# same API keys (separate per-model RPM quota — does not consume 2.5-flash quota).
-GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
+# gemini-2.5-flash-lite replaces deprecated gemini-2.0-flash (retired June 1 2026).
+# Runs on separate serving infrastructure from gemini-2.5-flash with its own
+# independent RPM quota per key — outages on the 2.5-flash tier do not
+# co-degrade 2.5-flash-lite. Quality is adequate for single-row retries.
+# NOTE: verify exact model string against
+#   https://ai.google.dev/gemini-api/docs/models if the endpoint returns 404.
+GEMINI_FALLBACK_MODEL = "gemini-2.5-flash-lite"
 GEMINI_FALLBACK_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_FALLBACK_MODEL}:generateContent"
 # Phase 3: Vertex AI fallback — fires only when both gemini-2.5-flash AND
-# gemini-2.0-flash fail on all groups (gateway-level outage on
+# gemini-2.5-flash-lite fail on all groups (gateway-level outage on
 # generativelanguage.googleapis.com). Vertex AI uses aiplatform.googleapis.com,
 # a completely separate infrastructure tier with enterprise SLA — unaffected
 # by developer API congestion events. Requires two GitHub Actions secrets:
@@ -61,7 +63,6 @@ ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("IT_TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("IT_TELEGRAM_CHAT_ID",   "")
-GEMINI_API_KEY = os.environ.get("ITGEMINI_API_KEY",     "")
 
 # CDReader language configuration.
 # TO_LANGUAGE: numeric code for the target language in CatChapterList API calls.
@@ -248,6 +249,7 @@ _RETRY_COOLDOWN_MIN_CALLS: int = 3     # ISSUE 8: min successful API calls befor
 _BATCH_SIZE: int = 40                  # rows per Gemini batch call
 _BATCH_MAX_RETRIES_429: int = 3        # max full RPM-reset rotations per batch before giving up
 _MAX_503_ATTEMPTS: int = 3             # Phase 2: 503 retry attempts (15s + 20s + 30s = 65s total)
+_SOFT_NONE_BACKOFF_SECS: int = 7       # Fix D: backoff when all groups return soft-None (HTTP 200 empty candidates)
 
 # Gateway-level 503 fast-path: when generativelanguage.googleapis.com is saturated,
 # skip primary model + Phase 1 (same gateway) and go straight to Vertex AI.
@@ -893,6 +895,25 @@ _BEGLEITSATZ_BASE = re.compile(
     re.IGNORECASE | re.VERBOSE
 )
 
+# _SVCOLON_SV_RE: compiled once at module level (used inside _post_process).
+# Identical verb list to the SV+colon structural bleed guard.
+_SVCOLON_SV_RE = re.compile(
+    r'\b(?:'
+    r'disse|chiese|rispose|replic\u00f2|domand\u00f2|aggiunse|osserv\u00f2|'
+    r'afferm\u00f2|comment\u00f2|esclam\u00f2|sussurr\u00f2|mormor\u00f2|'
+    r'grid\u00f2|sbuff\u00f2|spieg\u00f2|continu\u00f2|not\u00f2|bisbigli\u00f2|'
+    r'rifer\u00ec|prosegu\u00ec|dichiar\u00f2|protest\u00f2|interromp\u00f2|'
+    r'balbett\u00f2|inform\u00f2|rivel\u00f2|confess\u00f2|avanz\u00f2|'
+    r'precis\u00f2|specific\u00f2|puntualiz\u00f2|sentenzi\u00f2|ammutol\u00ec|'
+    r'esit\u00f2|rassicur\u00f2|rimprover\u00f2|ammon\u00ec'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Quote roles that legitimately end with narration+colon (not a bleed signal).
+_OPEN_ROLES = frozenset({'open', 'inline_open'})
+
+
 def _is_begleitsatz(text, _max_words=10):
     """True only if text is a genuine attribution clause (inciso attributivo).
     Guards against false positives:
@@ -1092,10 +1113,15 @@ _SYNONYMS = [
     (r'\bsilenziosamente\b', 'in silenzio'),
     # Session 13: common fiction verbs previously missing (reduce 'no fallback possible')
     (r'\baprì\b', 'spalancò'),         # spalancò: "flung open" — safe intensifier for aprì
-    (r'\buscì\b', 'se ne andò'),       # se ne andò: neutral exit verb
+    (r'\buscì\b', 'se ne partì'),       # se ne partì: neutral exit verb (andò avoided — chain risk with andò→si diresse)
     (r'\bentrò\b', 'fece ingresso'),   # fece ingresso: formal variant of entrò
     (r'\bcorse\b', 'si precipitò'),    # si precipitò: "rushed" — safe near-synonym
     (r'\bcadde\b', 'precipitò'),       # precipitò: "fell/plummeted" — safe for cadde
+    # Session 15: additional coverage (reduce 'no fallback possible' on high-frequency fiction verbs)
+    (r'\btacque\b', 'ammutolì'),        # ammutolì: "fell silent" — pass. rem. of ammutolire; safe
+    (r'\bsorrideva\b', 'sogghignava'),         # sogghignava: safe imperfect near-synonym of sorrideva
+    (r'\bseppe\b', 'apprese'),                 # apprese: "learned/found out" — pass. rem. of apprendere; safe
+    (r'\bsmise\b', 'cessò'),             # cessò: "stopped" — safe near-synonym of smise
 ]
 
 
@@ -1239,16 +1265,27 @@ def _call_vertex_ai(prompt, temperature=0.5, max_tokens=2048, call_timeout=25):
         _vx_body = _vx_resp.json()
         _vx_cands = _vx_body.get("candidates", [])
         if not _vx_cands:
+            log(f"    ⚠️  Phase 3 Vertex AI: empty candidates "
+                f"(promptFeedback={_vx_body.get('promptFeedback', {}).get('blockReason', '?')})")
             return None
         _vx_text = (
             _vx_cands[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
         )
         if not _vx_text:
+            log(f"    ⚠️  Phase 3 Vertex AI: empty text "
+                f"(finishReason={_vx_cands[0].get('finishReason', '?')})")
             return None
         _vx_text = _clean_llm_json(_vx_text)
         _vx_parsed = _vx_json.loads(_vx_text)
         if isinstance(_vx_parsed, list) and _vx_parsed:
             return _vx_parsed
+        # Bare-object response: recovery/force-retry prompts sometimes elicit
+        # a single {"sort":N, "content":"..."} instead of [{...}]. Wrap it so
+        # callers that expect a list receive a valid 1-element list.
+        if isinstance(_vx_parsed, dict) and _vx_parsed:
+            return [_vx_parsed]
+        log(f"    ⚠️  Phase 3 Vertex AI: unexpected response shape "
+            f"({type(_vx_parsed).__name__}, empty or unknown) — returning None")
     except ImportError:
         log("    ⚠️  Phase 3 Vertex AI: google-auth not installed")
     except json.JSONDecodeError:
@@ -1393,7 +1430,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
     # ── Gateway fast-path: skip primary + Phase 1 when gateway is confirmed down ──
     # After _VERTEX_FAST_PATH_THRESHOLD consecutive rows where only Vertex AI succeeded,
     # the gateway (generativelanguage.googleapis.com) is saturated. Both gemini-2.5-flash
-    # and gemini-2.0-flash share this gateway, so trying them wastes ~13-15s per row.
+    # and gemini-2.5-flash-lite share this gateway, so trying them wastes ~13-15s per row.
     # Go straight to Vertex AI (separate infrastructure: aiplatform.googleapis.com).
     if _consecutive_vertex_only >= _VERTEX_FAST_PATH_THRESHOLD and VERTEX_SA_JSON and VERTEX_PROJECT:
         log(f"    ⚡ Gateway fast-path: skipping primary+Phase 1 "
@@ -1489,7 +1526,13 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         except json.JSONDecodeError:
             log(f"    ⚠️ Gemini returned unparseable JSON: {text[:100]!r}")
             return None, False, False
-        return (parsed if isinstance(parsed, list) and parsed else None), False, False
+        if isinstance(parsed, list) and parsed:
+            return parsed, False, False
+        # Bare-object response: recovery/force-retry prompts return {"sort":N,"content":"..."}.
+        # Wrap to list so callers expecting isinstance(result, list) receive a valid result.
+        if isinstance(parsed, dict) and parsed:
+            return [parsed], False, False
+        return None, False, False
 
     # ── Strategy: try one key from each account group ─────────────────────
     # Round-robin starting group so consecutive retry rows don't always hit
@@ -1559,15 +1602,14 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
     # all keys with zero useful calls.
     _non_blocked_groups = n_groups - len(_rpm_blocked_groups)
     if _soft_none_groups > 0 and _soft_none_groups >= _non_blocked_groups:
-        _soft_backoff = 7  # 7s — enough for one RPM window tick, short enough not to stall retry loops
         log(f"    ℹ️ Fix D: all {_soft_none_groups} non-RPM-blocked group(s) returned soft-None "
-            f"— waiting {_soft_backoff}s before second pass (possible Gemini high-load).")
-        time.sleep(_soft_backoff)
+            f"— waiting {_SOFT_NONE_BACKOFF_SECS}s before second pass (possible Gemini high-load).")
+        time.sleep(_SOFT_NONE_BACKOFF_SECS)
 
     # ── Gateway-level 503 detection ──────────────────────────────────────────
     # If ALL active groups returned 5xx/timeout exceptions (not RPM, not RPD —
     # infrastructure errors), the gateway is saturated. The second pass and
-    # Phase 1 (gemini-2.0-flash) share the same gateway and will also 503.
+    # Phase 1 (gemini-2.5-flash-lite) share the same gateway and will also 503.
     # Skip them entirely and go straight to Vertex AI (separate infrastructure).
     _active_group_count = sum(
         1 for gi in range(n_groups)
@@ -1647,13 +1689,13 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                 if _second_pass_attempts >= 3:
                     break  # give up after 3 attempts in the second pass
 
-    # ── Phase 1: gemini-2.0-flash fallback pass ───────────────────────────
+    # ── Phase 1: gemini-2.5-flash-lite fallback pass ───────────────────
     # Fires only when ALL groups failed on gemini-2.5-flash (first+second pass
-    # returned nothing). Uses the same API keys — gemini-2.0-flash has its own
+    # returned nothing). Uses the same API keys — gemini-2.5-flash-lite has its own
     # independent RPM quota per key, so this does not consume 2.5-flash quota.
     # One attempt per account group, no cooldown check (last-resort fast sweep).
     # Skips RPD-exhausted and 403-excluded keys; ignores RPM blocks from the
-    # primary pass since 2.0-flash RPM is independent.
+    # primary pass since 2.5-flash-lite RPM is independent.
     if deadline and time.time() > deadline:
         return None
     _fallback_attempted = False
@@ -1708,7 +1750,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         log(f"    ⚠️  Phase 1 fallback: {GEMINI_FALLBACK_MODEL} also failed on all groups")
 
     # ── Phase 3: Vertex AI fallback ────────────────────────────────────────────────────────
-    # Fires when both gemini-2.5-flash and gemini-2.0-flash have failed on all groups.
+    # Fires when both gemini-2.5-flash and gemini-2.5-flash-lite have failed on all groups.
     # Uses extracted _call_vertex_ai() helper (with credential caching).
     if VERTEX_SA_JSON and VERTEX_PROJECT:
         if deadline and time.time() > deadline:
@@ -2238,8 +2280,17 @@ _RECOVERY_PROMPT = (
 def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
     """Remedy D: Called when finish_chapter returns ErrMessage10.
     Re-fetches saved rows, identifies the top _RECOVERY_MAX_ROWS rows by highest
-    similarity to original MT, re-edits via Gemini, re-submits, retries finish once.
-    Returns True if recovery succeeded, False otherwise."""
+    similarity to original MT, re-edits, re-submits, retries finish once.
+    Returns True if recovery succeeded, False otherwise.
+
+    Fallback chain per row (session 14):
+      1. _call_gemini_simple with 30s wall-clock deadline (prevents 2-4min
+         soft-None key-cycling observed on outage days).
+      2. _call_vertex_ai direct (if Gemini returns None) — bypasses the slow
+         Phase1+Phase3 chain in _call_gemini_simple.
+      3. Vertex-direct mode: after the first row where Vertex succeeds while
+         Gemini failed, all remaining rows skip Gemini entirely.
+      4. Abort after 3 consecutive all-failures (Gemini + Vertex both None)."""
     log(f"  \U0001f501 ErrMessage10 recovery: re-fetching saved rows for chapter {chapter_id}...")
 
     try:
@@ -2307,6 +2358,7 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
 
     corrections = []
     _consecutive_failures = 0
+    _recovery_vertex_direct = False  # True once Vertex succeeds after Gemini fails
 
     for sort, sim, saved_content, mt_content in targets:
         source_row = rows_by_sort.get(sort, {})
@@ -2320,7 +2372,35 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
             sort_num=sort,
         )
 
-        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=4096, call_timeout=45)
+        # ── Step 1: Gemini (skipped in Vertex-direct mode) ──────────────────────
+        # 30s deadline: prevents the 2-4min soft-None key-cycling observed on
+        # outage days (HTTP 200 with empty candidates). A healthy gateway
+        # responds in 5-10s — well within the deadline. Deadline is only set
+        # when Vertex is configured, so there is always a fallback path.
+        result = None
+        if not _recovery_vertex_direct:
+            _g_deadline = (time.time() + 30
+                           if (VERTEX_SA_JSON and VERTEX_PROJECT) else None)
+            result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=4096,
+                                         call_timeout=45, deadline=_g_deadline)
+            if not (result and isinstance(result, list) and result):
+                result = None  # normalise falsy / non-list return values
+
+        # ── Step 2: Vertex AI direct fallback ──────────────────────────────────────────
+        # Called when Gemini returned None OR Vertex-direct mode is active.
+        # Bypasses the slow Phase 1 + Phase 3 tail of _call_gemini_simple,
+        # which is unreliable under the mixed soft-None / 503 outage pattern.
+        if result is None and VERTEX_SA_JSON and VERTEX_PROJECT:
+            if _recovery_vertex_direct:
+                log(f"  \u26a1 Recovery sort={sort}: Vertex-direct mode \u2014 skipping Gemini...")
+            else:
+                log(f"  \u26a1 Recovery sort={sort}: Gemini unavailable \u2014 Vertex AI fallback...")
+            result = _call_vertex_ai(prompt, temperature=0.7, max_tokens=4096, call_timeout=45)
+            if result and isinstance(result, list) and result:
+                if not _recovery_vertex_direct:
+                    _recovery_vertex_direct = True
+                    log(f"  \u26a1 Recovery: Vertex succeeded after Gemini failed \u2014 "
+                        f"engaging Vertex-direct mode for remaining rows.")
 
         if result and isinstance(result, list) and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
@@ -2329,10 +2409,10 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
             corrections.append({"sort": sort, "content": new_content})
             _consecutive_failures = 0
         else:
-            log(f"  \u26a0\ufe0f  Recovery sort={sort}: Gemini call failed.")
+            log(f"  \u26a0\ufe0f  Recovery sort={sort}: all calls failed (Gemini + Vertex).")
             _consecutive_failures += 1
             if _consecutive_failures >= 3:
-                log(f"  \u274c Recovery: 3 consecutive failures \u2014 aborting early.")
+                log(f"  \u274c Recovery: 3 consecutive all-failures \u2014 aborting early.")
                 break
 
     if not corrections:
@@ -2678,17 +2758,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
     #   4. EN source contains a speech quote — confirms a speech was expected on this row
     #      (if EN has no speech, a trailing colon is a different issue, not a bleed)
     #   5. No open-quote follows the SV verb (which would mean speech IS on this row)
-    _SVCOLON_SV = (
-        r'disse|chiese|rispose|replic\u00f2|domand\u00f2|aggiunse|osserv\u00f2|'
-        r'afferm\u00f2|comment\u00f2|esclam\u00f2|sussurr\u00f2|mormor\u00f2|'
-        r'grid\u00f2|sbuff\u00f2|spieg\u00f2|continu\u00f2|not\u00f2|bisbigli\u00f2|'
-        r'rifer\u00ec|prosegu\u00ec|dichiar\u00f2|protest\u00f2|interromp\u00f2|'
-        r'balbett\u00f2|inform\u00f2|rivel\u00f2|confess\u00f2|avanz\u00f2|'
-        r'precis\u00f2|specific\u00f2|puntualiz\u00f2|sentenzi\u00f2|ammutol\u00ec|'
-        r'esit\u00f2|rassicur\u00f2|rimprover\u00f2|ammon\u00ec'
-    )
     _svcolon_fixes = 0
-    _OPEN_ROLES = {'open', 'inline_open'}
     _qe_role_snap = {r.get('sort'): r.get('_quote_role', 'none') for r in sorted_rows}
 
     for _bi in range(len(_sorted_keys_pp) - 1):
@@ -2712,7 +2782,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
 
         # Condition 3: SV verb in last 10 words
         _tail_last10 = ' '.join(_out_n.split()[-10:])
-        if not re.search(r'\b(?:' + _SVCOLON_SV + r')\b', _tail_last10, re.IGNORECASE):
+        if not _SVCOLON_SV_RE.search(_tail_last10):
             continue
 
         # Condition 4: EN source contains a speech quote
@@ -2724,7 +2794,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
             continue
 
         # Condition 5: no open quote follows the SV verb (speech IS on this row)
-        _sv_m = re.search(r'\b(?:' + _SVCOLON_SV + r')\b', _out_n, re.IGNORECASE)
+        _sv_m = _SVCOLON_SV_RE.search(_out_n)
         if _sv_m and re.search(r'["\u201c\u00ab]', _out_n[_sv_m.end():]):
             continue
 
@@ -5733,7 +5803,7 @@ def run_test():
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
     # Log status of every configured Gemini key dynamically
-    # Env var names: GEMINI_API_KEY (no suffix), then GEMINI_API_KEY_2 through _28
+    # Env var names: ITGEMINI_API_KEY (no suffix), then ITGEMINI_API_KEY_2 through _37
     key_statuses = " | ".join(
         f"key {i+1}: {'✅' if k else '⚠️ not set'}"
         for i, k in enumerate(
@@ -5779,7 +5849,7 @@ def run_test():
     result = rephrase_with_gemini(TEST_ROWS, SAMPLE_GLOSSARY, "TEST BOOK")
 
     if not result:
-        msg = "❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys (ITGEMINI_API_KEY through ITGEMINI_API_KEY_7)."
+        msg = "❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys (ITGEMINI_API_KEY through ITGEMINI_API_KEY_37)."
         log(msg)
         send_telegram(msg)
         return
