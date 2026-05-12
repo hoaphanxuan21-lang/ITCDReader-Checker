@@ -1295,7 +1295,7 @@ def _call_vertex_ai(prompt, temperature=0.5, max_tokens=2048, call_timeout=25):
     return None
 
 
-def _call_vertex_ai_batch(prompt, row_count, call_timeout=90):
+def _call_vertex_ai_batch(prompt, row_count, call_timeout=120):
     """Vertex AI batch fallback — fires when all AI Studio gateway attempts are 503.
 
     Sends the same full batch prompt to Vertex AI (aiplatform.googleapis.com),
@@ -1303,16 +1303,20 @@ def _call_vertex_ai_batch(prompt, row_count, call_timeout=90):
     A total 503 outage on the AI Studio gateway does not affect Vertex AI.
 
     Key differences from _call_vertex_ai (single-row):
-      - thinkingBudget=0: thinking tokens are disabled. Without this, gemini-2.5-flash
-        would think for the entire 40-row batch (~600 tokens × 40 = 24K extra output
-        tokens), making the call slower than the current retry-loop path and
-        increasing cost ~10× vs what we'd spend in the retry loop. With thinking off,
-        batch quality is equivalent to what AI Studio batch produces normally.
+      - thinkingBudget=512: low thinking budget (session 15 tuning). thinkingBudget=0
+        (previous default) produced ~68% near-verbatim rows on sustained 503 days,
+        because the model without any reasoning takes the path of least resistance and
+        makes only trivial changes. 512 tokens is enough to plan 2-3 lexical
+        improvements per sentence without the full uncapped overhead (~24K tokens).
+        Cost delta vs thinkingBudget=0: ~$0.003/batch — negligible.
+      - temperature=0.45: raised from 0.25 (session 15 tuning). Higher temperature
+        forces more lexical exploration, directly reducing similarity to MT.
+        The batch quality guards (bleed, trunc) remain unchanged as safety net.
       - maxOutputTokens=16384: matches the AI Studio batch call (needs headroom for
         40 rows of Italian prose).
       - responseMimeType="application/json": instructs the model to return only JSON,
         consistent with how AI Studio batch calls work.
-      - call_timeout=90: longer than single-row (25s) to accommodate 40-row output.
+      - call_timeout=120: raised from 90s to accommodate thinking token latency.
       - Reuses _vx_cached_token (shared with _call_vertex_ai) — no double auth overhead.
 
     Returns parsed JSON list or None on any failure.
@@ -1353,10 +1357,10 @@ def _call_vertex_ai_batch(prompt, row_count, call_timeout=90):
             json={
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {
-                    "temperature": 0.25,
+                    "temperature": 0.45,
                     "maxOutputTokens": 16384,
                     "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingBudget": 0},  # disable thinking for batch
+                    "thinkingConfig": {"thinkingBudget": 512},  # low budget: enough to plan rephrasing without 24K token overhead
                 },
             },
             timeout=call_timeout,
@@ -4637,8 +4641,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # ── Vertex AI batch fallback (Phase B) ───────────────────────────────────
         # Fires when _call_gemini returns None (all 3 × 503 attempts exhausted).
         # Uses the same prompt already built above — no extra token/API cost for the
-        # prompt itself. Thinking is explicitly disabled (thinkingBudget=0) so latency
-        # and cost are comparable to a normal AI Studio batch call (~$0.013/batch).
+        # prompt itself. thinkingBudget=512 + temperature=0.45 (session 15): tuned to
+        # reduce near-verbatim output (~68% flagging rate observed with Budget=0) while
+        # keeping per-batch latency well below the retry-loop alternative.
         if result is None and VERTEX_SA_JSON and VERTEX_PROJECT:
             log(f"  ⚡ Vertex AI batch fallback: attempting {len(batch)} rows "
                 f"(all gateway attempts 503)...")
