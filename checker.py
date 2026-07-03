@@ -266,6 +266,7 @@ _SOFT_NONE_BACKOFF_SECS: int = 7       # Fix D: backoff when all groups return s
 # Gateway-level 503 fast-path: when generativelanguage.googleapis.com is saturated,
 # skip primary model + Phase 1 (same gateway) and go straight to Vertex AI.
 _consecutive_vertex_only: int = 0      # rows where only Vertex AI succeeded
+_paid_lane_served: int = 0             # OPT-6: single-row calls served by the paid-key fast lane this run
 _VERTEX_FAST_PATH_THRESHOLD: int = 3   # skip primary after this many consecutive Vertex-only successes
 _vx_cached_token: str = ""             # cached Vertex AI bearer token
 _vx_cached_token_expiry: float = 0.0   # epoch time when cached token expires
@@ -1459,7 +1460,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
       5. PER-ROW DEADLINE: Enforced internally — if deadline is set, each group iteration
          and the second-pass wait check it before proceeding.
     """
-    global _retry_scan_offset, _consecutive_vertex_only
+    global _retry_scan_offset, _consecutive_vertex_only, _paid_lane_served
 
     keys_all = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys]
     if not keys_all:
@@ -1514,9 +1515,16 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
                     # OPT-3: schema-constrained decoding — see _RETRY_RESPONSE_SCHEMA.
+                    # OPT-5: cap thinking. Run 2026-07-03 measured ~8.9s per retry
+                    # row on an always-cooled paid key with a healthy gateway —
+                    # i.e. latency was dominated by default DYNAMIC thinking.
+                    # Single-row edits are mechanical; 512 matches the validated
+                    # Vertex-path budget (0 caused ~68% near-verbatim flagging,
+                    # 512 was clean). Expected: ~3-5s per row.
                     "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens,
                                          "responseMimeType": "application/json",
-                                         "responseSchema": _RETRY_RESPONSE_SCHEMA},
+                                         "responseSchema": _RETRY_RESPONSE_SCHEMA,
+                                         "thinkingConfig": {"thinkingBudget": 512}},
                 },
                 timeout=call_timeout,
             )
@@ -1592,8 +1600,13 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
     #                gateway-5xx detection handles systemic outages.
     if (_paid_key
             and _paid_key not in _rpd_exhausted_keys
-            and _paid_key not in _403_excluded_keys
-            and _is_cooled(_paid_key)):
+            and _paid_key not in _403_excluded_keys):
+        # OPT-1b: if the paid key is alive but still inside its 0.4s interval,
+        # wait out the remainder rather than falling through — a free key with
+        # a 6s cooldown is never cheaper than a ≤0.4s sleep.
+        _paid_remaining = _PAID_KEY_MIN_INTERVAL - (time.time() - _key_last_used.get(_paid_key, 0.0))
+        if _paid_remaining > 0:
+            time.sleep(min(_paid_remaining, _PAID_KEY_MIN_INTERVAL))
         try:
             result, is_rpd, is_rpm = _one_call(_paid_key)
             if is_rpd:
@@ -1601,6 +1614,12 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                 log("    📵 Paid key (28) RPD-exhausted — falling back to free-key rotation")
             elif result is not None:
                 _consecutive_vertex_only = 0  # primary succeeded — reset gateway fast-path
+                # OPT-6: observability — the 2026-07-03 run gave no positive signal
+                # that the fast lane was serving (success was silent; only inferable
+                # from the ABSENCE of rotation logs). Log once per run, then count.
+                _paid_lane_served += 1
+                if _paid_lane_served == 1:
+                    log("    ⚡ OPT-1 paid-key fast lane active (key 28) — serving single-row calls")
                 return result
             elif is_rpm:
                 log("    ℹ️ Paid key (28) RPM-limited — falling back to free-key rotation")
@@ -5027,7 +5046,22 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # If no Gemini call was made in the batch phase, no RPM quota was consumed and
     # the cooldown is a pure waste of time (65s during an already slow outage run).
     _pre_retry_end = 0.0   # A2: timestamp of pre-retry cooldown completion
-    if total_batches >= 2 and not _all_keys_rpd_dead() and _any_batch_success:
+    # OPT-4: the 65s cooldown exists to let FREE-key RPM windows expire before
+    # the retry loop scans them. With the OPT-1 paid-key fast lane, the retry
+    # loop starts on key 28 (150 RPM, always available) and only touches free
+    # keys if the paid key dies — by which point their windows have long
+    # expired naturally during elapsed retry time. Run 2026-07-03 confirmed:
+    # 32/32 retries served without a single free-key rotation, making the
+    # cooldown 65s of pure dead time. Skip it whenever the paid key is alive;
+    # the original cooldown remains as fallback for paid-key-dead runs.
+    _paid_alive = (_PAID_KEY
+                   and _PAID_KEY not in _rpd_exhausted_keys
+                   and _PAID_KEY not in _403_excluded_keys)
+    if total_batches >= 2 and _any_batch_success and _paid_alive:
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)  # clear stale RPM flags for free-key fallback
+        log(f"  ⏭  OPT-4: paid key alive — skipping {_PRE_RETRY_COOLDOWN}s pre-retry RPM cooldown "
+            f"(retry loop starts on paid-key fast lane).")
+    elif total_batches >= 2 and not _all_keys_rpd_dead() and _any_batch_success:
         _cooldown = _PRE_RETRY_COOLDOWN
         log(f"  ⏳ Pre-retry RPM cooldown: {total_batches} batch(es) completed — waiting {_cooldown}s for RPM windows to expire...")
         time.sleep(_cooldown)
