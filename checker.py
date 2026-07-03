@@ -31,6 +31,18 @@ ClaimedChapter = namedtuple('ClaimedChapter', [
     'book', 'ch_name', 'ch_id', 'status', 'claim_proc_id', 'task_id'
 ])
 
+# ─── OPT-2: Shared HTTP session (connection pooling) ─────────────────────────
+# One TLS handshake per host instead of one per request. The pipeline makes
+# hundreds of HTTPS calls per run (CDReader API, 2 Gemini endpoints, Vertex,
+# Telegram); a pooled Session saves ~100-300ms per call and eliminates the
+# spurious connection-setup timeouts that previously fed the gateway-5xx
+# detector (_5xx_exception_groups) as false positives.
+# max_retries=0: ALL retry logic stays in the pipeline's own handlers — the
+# Session must never retry transparently, or 429/RPM accounting would drift.
+_HTTP = requests.Session()
+_HTTP.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=8, pool_maxsize=8, max_retries=0))
+
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -299,6 +311,28 @@ HEADERS = {
 
 WORD_CORRECTION_DEFAULT = json.dumps({"StatusCode": 0, "SpellErrors": [], "GrammaticalErrors": []})
 
+# ─── OPT-3: Structured-output schema for single-row retry calls ──────────────
+# Every _call_gemini_simple caller (unified retry, force-retry pass,
+# ErrMessage10 recovery, legacy single-row retry) expects the same shape:
+#   [{"sort": <int>, "content": "<text>"}]
+# Enforcing it via responseMimeType + responseSchema constrains decoding at
+# generation time, eliminating the unparseable-JSON / markdown-fence /
+# bare-prose soft-None class — each of which previously burned a full group
+# rotation (~20s+) and could cascade into Fix D backoff. _clean_llm_json and
+# the dict-wrap in _one_call stay in place as belt-and-braces.
+# Schema syntax: Gemini API OpenAPI-subset (UPPER-CASE type names).
+_RETRY_RESPONSE_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "sort":    {"type": "INTEGER"},
+            "content": {"type": "STRING"},
+        },
+        "required": ["sort", "content"],
+    },
+}
+
 # ─── Rephrasing prompt (universal rules) ─────────────────────────────────────
 BASE_PROMPT = """ROLE
 You are an experienced Italian editor working on machine-translated fiction. Your task
@@ -500,7 +534,7 @@ def send_telegram(message):
         log("Telegram not configured — skipping.")
         return
     try:
-        resp = requests.post(
+        resp = _HTTP.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT, "text": message, "parse_mode": "HTML"},
             timeout=10,
@@ -522,7 +556,7 @@ def send_telegram(message):
 def _cdreader_get(url, headers, timeout=15):
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp = _HTTP.get(url, headers=headers, timeout=timeout)
             if resp.status_code in (500, 502, 503, 504) and attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
@@ -538,7 +572,7 @@ def _cdreader_get(url, headers, timeout=15):
 def _cdreader_post(url, headers, json=None, data=None, timeout=15):
     for attempt in range(3):
         try:
-            resp = requests.post(url, headers=headers, json=json, data=data, timeout=timeout)
+            resp = _HTTP.post(url, headers=headers, json=json, data=data, timeout=timeout)
             if resp.status_code in (500, 502, 503, 504) and attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
@@ -554,7 +588,7 @@ def _cdreader_post(url, headers, json=None, data=None, timeout=15):
 def _cdreader_put(url, headers, data=None, timeout=60):
     for attempt in range(3):
         try:
-            resp = requests.put(url, headers=headers, data=data, timeout=timeout)
+            resp = _HTTP.put(url, headers=headers, data=data, timeout=timeout)
             if resp.status_code in (500, 502, 503, 504) and attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
@@ -1243,7 +1277,7 @@ def _call_vertex_ai(prompt, temperature=0.5, max_tokens=2048, call_timeout=25):
             f"/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}"
             f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
         )
-        _vx_resp = requests.post(
+        _vx_resp = _HTTP.post(
             _vx_url,
             headers={
                 "Authorization": f"Bearer {_vx_token}",
@@ -1348,7 +1382,7 @@ def _call_vertex_ai_batch(prompt, row_count, call_timeout=120):
             f"/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}"
             f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
         )
-        _vx_resp = requests.post(
+        _vx_resp = _HTTP.post(
             _vx_url,
             headers={
                 "Authorization": f"Bearer {_vx_token}",
@@ -1475,11 +1509,14 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         """
         _record_call(api_key)
         try:
-            resp = requests.post(
+            resp = _HTTP.post(
                 f"{GEMINI_URL}?key={api_key}",
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+                    # OPT-3: schema-constrained decoding — see _RETRY_RESPONSE_SCHEMA.
+                    "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens,
+                                         "responseMimeType": "application/json",
+                                         "responseSchema": _RETRY_RESPONSE_SCHEMA},
                 },
                 timeout=call_timeout,
             )
@@ -1538,6 +1575,39 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             return [parsed], False, False
         return None, False, False
 
+    # ── OPT-1: Paid-key fast lane ─────────────────────────────────────────
+    # Key 28 (paid tier, 150 RPM, 0.4s min interval) previously sat at
+    # position 27 of group C and was only reached after keys 19-27 were all
+    # hot or dead — effectively never. Try it FIRST for every single-row
+    # call: at 150 RPM it can serve the entire unified-retry loop
+    # back-to-back with zero RPM waits, which means the Option A adaptive
+    # cooldown and second-pass waits below rarely fire at all.
+    # Failure handling:
+    #   - RPD/403  → mark dead, fall through to free-key rotation
+    #   - 429-RPM  → fall through WITHOUT blocking group C: key 28 runs on
+    #                a separate paid-tier project (2026-04-08: account C
+    #                free keys were restricted while 28 was unaffected),
+    #                so its RPM state says nothing about keys 19-27.
+    #   - soft-None / exception → fall through; group rotation's own
+    #                gateway-5xx detection handles systemic outages.
+    if (_paid_key
+            and _paid_key not in _rpd_exhausted_keys
+            and _paid_key not in _403_excluded_keys
+            and _is_cooled(_paid_key)):
+        try:
+            result, is_rpd, is_rpm = _one_call(_paid_key)
+            if is_rpd:
+                _rpd_exhausted_keys.add(_paid_key)
+                log("    📵 Paid key (28) RPD-exhausted — falling back to free-key rotation")
+            elif result is not None:
+                _consecutive_vertex_only = 0  # primary succeeded — reset gateway fast-path
+                return result
+            elif is_rpm:
+                log("    ℹ️ Paid key (28) RPM-limited — falling back to free-key rotation")
+            # soft-None: fall through silently (already logged inside _one_call)
+        except Exception as e:
+            log(f"    ⚠️ Paid-key fast lane error: {e} — falling back to free-key rotation")
+
     # ── Strategy: try one key from each account group ─────────────────────
     # Round-robin starting group so consecutive retry rows don't always hit
     # the same account first. Within each group, pick the first cooled key.
@@ -1556,7 +1626,10 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
             continue
         group_keys = [k for k in _ACCOUNT_GROUPS[gi]
                       if k in keys_all and k not in _rpd_exhausted_keys
-                      and k not in _403_excluded_keys]
+                      and k not in _403_excluded_keys
+                      and k != _paid_key]  # OPT-1: fast lane owns key 28; also prevents
+                                           # a paid-key 429 (separate project) from
+                                           # RPM-blocking group C's free keys
         if not group_keys:
             continue
 
@@ -1644,6 +1717,11 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         # All groups either RPM-blocked or RPD-dead — try waiting for the soonest key
         available_keys = [k for k in keys_all if k not in _rpd_exhausted_keys
                           and k not in _403_excluded_keys]
+    # OPT-1: paid key first in the second pass — it re-cools in 0.4s, so a
+    # transient fast-lane soft-None gets an immediate second chance before
+    # any free key (6s cooldown) is even eligible. Stable sort preserves the
+    # original GEMINI_KEYS order among free keys.
+    available_keys.sort(key=lambda k: 0 if k == _paid_key else 1)
 
     if available_keys:
         now = time.time()
@@ -1680,7 +1758,10 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
                         continue
                     if is_rpm:
                         # ISSUE 10 fix: propagate RPM block so we skip this group's remaining keys
-                        _rpm_blocked_groups.add(_key_account_group(k))
+                        # OPT-1 guard: a paid-key (28) RPM is its own separate
+                        # project — never block group C's free keys for it.
+                        if k != _paid_key:
+                            _rpm_blocked_groups.add(_key_account_group(k))
                         _second_pass_attempts += 1
                         continue
                     if result is not None:
@@ -1715,12 +1796,15 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None,
         _fallback_attempted = True
         try:
             _record_call(fb_key)
-            resp = requests.post(
+            resp = _HTTP.post(
                 f"{GEMINI_FALLBACK_URL}?key={fb_key}",
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
+                    # OPT-3: schema-constrained decoding (same as primary path).
                     "generationConfig": {"temperature": temperature,
-                                         "maxOutputTokens": max_tokens},
+                                         "maxOutputTokens": max_tokens,
+                                         "responseMimeType": "application/json",
+                                         "responseSchema": _RETRY_RESPONSE_SCHEMA},
                 },
                 timeout=call_timeout,
             )
@@ -4362,7 +4446,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     _exhausted_keys.intersection_update(_rpd_exhausted_keys)  # clear RPM state, preserve RPD
                     time.sleep(wait)
                     continue
-                resp = requests.post(
+                resp = _HTTP.post(
                     f"{GEMINI_URL}?key={api_key}",
                     json={
                         "contents": [{"parts": [{"text": batch_prompt}]}],
